@@ -1,11 +1,13 @@
 {
   "name": "standout-email-workers",
   "version": "1.0.0",
-  "description": "Hourly abandoned-user job recommendation worker for Standout",
+  "description": "Abandonment email cron workers for Standout (Vercel + Brevo + Supabase)",
   "type": "commonjs",
+  "scripts": {
+    "test": "node --test \"test/*.test.js\""
+  },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.27.0",
-    "@getbrevo/brevo": "^2.2.0",
     "@supabase/supabase-js": "2.45.0",
     "@vercel/kv": "^1.0.1",
     "dotenv": "^16.4.5"

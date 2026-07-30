@@ -1,100 +1,125 @@
-const { createClient } = require('@supabase/supabase-js');
+/**
+ * abandonment-job-email-2/queries.js — all Supabase reads for email 2.
+ */
 
-const ONE_HOUR_MS  = 60 * 60 * 1000;
-const PAID_STATUSES = ['active', 'trialing'];
+const { getSupabase } = require('../lib/supabase');
+const { PROFILE_COLUMNS, filterSendable, fetchNewestSurveyIds } = require('../lib/eligibility');
+const { mapWithConcurrency, chunk, RPC_CONCURRENCY } = require('../lib/concurrency');
 
-let _client = null;
+const ONE_HOUR_MS = 60 * 60 * 1000;
 
-function getSupabase() {
-  if (_client) return _client;
-  const { SUPABASE_URL, SUPABASE_SERVICE_KEY } = process.env;
-  if (!SUPABASE_URL || !SUPABASE_SERVICE_KEY) throw new Error('Missing Supabase env vars.');
-  _client = createClient(SUPABASE_URL, SUPABASE_SERVICE_KEY, { auth: { persistSession: false } });
-  return _client;
-}
+// Email 2 lands 24h after email 1 actually went out — not 25h after signup.
+// Anchoring on the send marker instead of created_at means a user whose email 1
+// was delayed still gets a 24h gap rather than a 20-minute one.
+const MIN_GAP_MS = 24 * ONE_HOUR_MS;
+// Backstop, same reasoning as worker 1: don't mail the historical backlog on
+// first deploy.
+const MAX_AGE_MS = 96 * ONE_HOUR_MS;
+
+// The product's sendable-job window. Was 30, which overstated the count
+// relative to what the dashboard actually shows when they click through.
+const COUNT_FRESH_DAYS = 21;
+const COUNT_LIMIT = 20;
+
+const JOB_COLUMNS =
+  'id, title, company, location, salary_min, salary_max, work_type, source_url, role_category, first_seen_at, last_seen_at';
 
 /**
- * Find free users who:
- * 1. Have a parsed resume
- * 2. Created their account between 25–26 hours ago (24hr window, checked hourly)
- * 3. Have no active subscription
- * 4. Received Email 1 (key exists in KV) — meaning they were eligible then too
+ * Users who were sent email 1 at least 24h ago, have not been sent email 2,
+ * signed up within the last 96h, and pass the shared exclusions.
  */
 async function findEligibleUsers() {
   const supabase = getSupabase();
-
-  const windowStart = new Date(Date.now() - 26 * ONE_HOUR_MS).toISOString();
-  const windowEnd   = new Date(Date.now() - 25 * ONE_HOUR_MS).toISOString();
+  const now = Date.now();
+  const sentBefore = new Date(now - MIN_GAP_MS).toISOString();
+  const createdAfter = new Date(now - MAX_AGE_MS).toISOString();
 
   const { data: profiles, error } = await supabase
     .from('profiles')
-    .select('id, email, resume_parsed, subscription_status, created_at')
+    .select(PROFILE_COLUMNS)
+    .not('abandonment_email_1_sent_at', 'is', null)
+    .lte('abandonment_email_1_sent_at', sentBefore)
+    .is('abandonment_email_2_sent_at', null)
+    .gte('created_at', createdAfter)
     .not('resume_parsed', 'is', null)
-    .gte('created_at', windowStart)
-    .lte('created_at', windowEnd);
+    .not('email', 'is', null);
 
   if (error) throw new Error(`profiles query failed: ${error.message}`);
 
-  return (profiles || [])
-    .filter(p => !PAID_STATUSES.includes(p.subscription_status) && p.email)
-    .map(p => ({ id: p.id, email: p.email, resume_parsed: p.resume_parsed, created_at: p.created_at }));
+  const { users } = await filterSendable(supabase, profiles || [], 'abandonment-job-email-2');
+  return users;
 }
 
 /**
- * For each user, get:
- * 1. The same job that was sent in Email 1 (from KV key sent:{userId})
- * 2. Total match count from match_jobs_for_survey RPC
- * Returns a Map of userId -> { job, matchCount }
+ * For each user: the job featured in email 1 (from
+ * profiles.abandonment_email_1_job_id — no KV dependency, which is what used to
+ * make this whole worker throw) plus a live match count.
+ *
+ * Jobs are fetched in ONE batched query; the RPC fan-out is bounded.
+ * Returns Map<userId, { job, matchCount }>.
  */
-async function findJobsAndMatchCounts(users, sentTracker) {
-  const supabase = getSupabase();
+async function findJobsAndMatchCounts(users) {
   const result = new Map();
+  if (!users || users.length === 0) return result;
 
-  // Fetch survey IDs in one query
-  const { data: surveys } = await supabase
-    .from('surveys')
-    .select('id, user_id')
-    .in('user_id', users.map(u => u.id));
+  const supabase = getSupabase();
 
-  const surveyByUser = new Map((surveys || []).map(s => [s.user_id, s.id]));
+  // Step 1: one batched fetch for every distinct email-1 job.
+  const jobIds = [
+    ...new Set(users.map((u) => u.abandonment_email_1_job_id).filter((id) => id != null)),
+  ];
+  const jobById = new Map();
+  for (const part of chunk(jobIds, 200)) {
+    const { data, error } = await supabase.from('jobs').select(JOB_COLUMNS).in('id', part);
+    if (error) throw new Error(`jobs query failed: ${error.message}`);
+    for (const row of data || []) jobById.set(row.id, row);
+  }
 
-  await Promise.all(users.map(async user => {
-    // Get job ID from Email 1 KV entry
-    const email1JobId = await sentTracker.getSentJobId(user.id);
-    if (!email1JobId) {
-      console.log(`[email2/queries] No Email 1 record for ${user.email} — skipping.`);
-      return;
+  // Step 2: match counts, bounded concurrency (match_jobs_for_survey is an
+  // HNSW vector search — an unbounded fan-out here hit prod Postgres).
+  const surveyByUser = await fetchNewestSurveyIds(supabase, users.map((u) => u.id));
+
+  const rows = await mapWithConcurrency(users, RPC_CONCURRENCY, async (user) => {
+    const jobId = user.abandonment_email_1_job_id;
+    if (jobId == null) {
+      console.log(`[email2/queries] No email-1 job id for user ${user.id} — skipping.`);
+      return null;
+    }
+    const job = jobById.get(jobId);
+    if (!job) {
+      console.log(`[email2/queries] Job ${jobId} not found for user ${user.id} — skipping.`);
+      return null;
     }
 
-    // Fetch the job row
-    const { data: job, error: jobErr } = await supabase
-      .from('jobs')
-      .select('id, title, company, location, salary_min, salary_max, work_type, source_url, role_category, first_seen_at, last_seen_at')
-      .eq('id', email1JobId)
-      .single();
-
-    if (jobErr || !job) {
-      console.log(`[email2/queries] Job ${email1JobId} not found for ${user.email} — skipping.`);
-      return;
-    }
-
-    // Get match count from RPC (use limit=20 to get a real count)
     let matchCount = 0;
     const surveyId = surveyByUser.get(user.id);
     if (surveyId) {
-      const { data: matches } = await supabase.rpc('match_jobs_for_survey', {
+      const { data: matches, error: rpcError } = await supabase.rpc('match_jobs_for_survey', {
         p_survey_id: surveyId,
-        p_limit: 20,
-        p_fresh_days: 30, // broader window for count purposes
+        p_limit: COUNT_LIMIT,
+        p_fresh_days: COUNT_FRESH_DAYS,
       });
-      matchCount = (matches || []).length;
+      if (rpcError) {
+        console.error(`[email2/queries] match count failed for user ${user.id}: ${rpcError.message}`);
+      } else {
+        matchCount = (matches || []).length;
+      }
     }
 
-    result.set(user.id, { job, matchCount });
-    console.log(`[email2/queries] ${user.email} → "${job.title}" at ${job.company} | ${matchCount} matches`);
-  }));
+    return { userId: user.id, job, matchCount };
+  });
+
+  for (const row of rows) {
+    if (row) result.set(row.userId, { job: row.job, matchCount: row.matchCount });
+  }
 
   return result;
 }
 
-module.exports = { getSupabase, findEligibleUsers, findJobsAndMatchCounts };
+module.exports = {
+  findEligibleUsers,
+  findJobsAndMatchCounts,
+  MIN_GAP_MS,
+  MAX_AGE_MS,
+  COUNT_FRESH_DAYS,
+};

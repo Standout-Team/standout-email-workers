@@ -6,7 +6,12 @@
     },
     {
       "path": "/api/abandonment-job-email-2",
-      "schedule": "0 * * * *"
+      "schedule": "30 * * * *"
     }
-  ]
+  ],
+  "functions": {
+    "api/*.js": {
+      "maxDuration": 300
+    }
+  }
 }

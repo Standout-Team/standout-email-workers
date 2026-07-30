@@ -1,7 +1,6 @@
 node_modules/
-.env
-.env.local
 .vercel
 
-# Local dedup state — never commit
-abandonment-job-email/sent.json
+# Never commit real credentials — .env.example is the only tracked env file.
+.env*
+!.env.example
