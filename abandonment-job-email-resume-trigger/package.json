@@ -1,0 +1,17 @@
+{
+  "name": "abandonment-job-email",
+  "version": "1.0.0",
+  "description": "Hourly worker that emails free Standout users their best untouched job match via Brevo",
+  "main": "index.js",
+  "type": "commonjs",
+  "scripts": {
+    "start": "node index.js",
+    "dry-run": "DRY_RUN=true node index.js"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.27.0",
+    "@getbrevo/brevo": "^2.2.0",
+    "@supabase/supabase-js": "2.45.0",
+    "dotenv": "^16.4.5"
+  }
+}

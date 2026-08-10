@@ -7,6 +7,10 @@
     {
       "path": "/api/abandonment-job-email-2",
       "schedule": "0 * * * *"
+    },
+    {
+      "path": "/api/abandonment-job-email-resume-trigger",
+      "schedule": "*/10 * * * *"
     }
   ]
 }
