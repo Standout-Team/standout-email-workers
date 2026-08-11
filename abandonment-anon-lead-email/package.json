@@ -1,0 +1,18 @@
+{
+  "name": "abandonment-anon-lead-email",
+  "version": "1.0.0",
+  "description": "Hourly worker that emails anonymous opted-in leads their top job match with a one-free-apply landing link via Brevo",
+  "main": "index.js",
+  "type": "commonjs",
+  "scripts": {
+    "start": "node index.js",
+    "dry-run": "DRY_RUN=true node index.js"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.27.0",
+    "@getbrevo/brevo": "^2.2.0",
+    "@supabase/supabase-js": "2.45.0",
+    "@vercel/kv": "^1.0.1",
+    "dotenv": "^16.4.5"
+  }
+}
