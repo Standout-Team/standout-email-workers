@@ -38,7 +38,28 @@ plausible email, created inside the run's window (below). Excludes existing `pro
 Dedup is **Vercel KV** (`anon_lead_sent:<email_lc>`, stored indefinitely — one send per
 lead email, ever), matching `abandonment-job-email/`. Without `KV_REST_API_URL` /
 `KV_REST_API_TOKEN` it falls back to an in-process `Set`: fine for a local dry run,
-useless in serverless. **Zero writes to Supabase.**
+useless in serverless, where every cold start wipes it. **Zero writes to Supabase.**
+
+##### Fail-closed dedup guard
+
+Because that fallback is silent, the worker **refuses real sends it cannot dedup**. The
+check runs at the top of `run()`, before any Supabase or Brevo work:
+
+| Environment | `DRY_RUN` | KV bound? | Behaviour |
+| --- | --- | --- | --- |
+| Vercel (production **or** preview) | `false` | no | **Throws.** Nothing is queried, nothing is sent, the hourly cron fails loudly in Vercel observability. |
+| Vercel | `true` | no | Warns with a `NON-DURABLE DEDUP` banner and runs, capped at **50**. |
+| Local | either | no | Same banner + 50 cap — one process spans the run, so the `Set` is honest. |
+| anywhere | either | yes | Normal. Cap untouched. |
+
+The forced cap is `min(existing cap, 50)`, so an operator cap below 50 still wins, and it
+applies to warn-mode dry runs too — a dry run predicts what a real run in that same
+environment would send. Every run's start line and JSON summary carry
+`dedup=durable|non-durable`.
+
+Preview deployments are deliberately covered: the guard keys off `process.env.VERCEL`, not
+`VERCEL_ENV`, because a preview carrying `DRY_RUN=false` and a live Brevo key mails real
+people exactly as hard as production does.
 
 Full spec + ops runbook: `docs/FREE_APPLY_LEADS.md` in the main `Standout-pro` repo.
 
@@ -71,8 +92,9 @@ set two env vars on the Vercel project. **The cron itself never changes.**
 
 Safe to run twice. Every send is recorded in KV before the next run reads it, and that
 check now runs in dry-run mode too — so a dry run *after* a partial drain reports the true
-remaining cohort instead of re-counting people who were already mailed. If a run times
-out, lower `SEND_CAP`.
+remaining cohort instead of re-counting people who were already mailed. A backfill can
+never drain with dedup quietly off: without the KV binding the worker refuses to send for
+real on Vercel (see the fail-closed guard above). If a run times out, lower `SEND_CAP`.
 
 ---
 

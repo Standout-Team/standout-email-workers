@@ -1,6 +1,14 @@
 require('dotenv').config();
 
-const { computeWindow, resolveSendCap, selectForSend, findAnonLeads, findFeaturedJobs } = require('./queries');
+const {
+  computeWindow,
+  resolveSendCap,
+  selectForSend,
+  evaluateDedupSafety,
+  capForDedupAction,
+  findAnonLeads,
+  findFeaturedJobs,
+} = require('./queries');
 const { generateMatchReasons } = require('./match-reason');
 const { sendJobEmail } = require('./brevo');
 const { signLeadToken, decodeLeadToken } = require('./lead-token');
@@ -158,9 +166,41 @@ async function run() {
 
   const win = computeWindow(Date.now(), process.env);
   if (win.warning) console.warn(`[abandonment-anon-lead-email] ${win.warning}`);
-  const { cap, warning: capWarning } = resolveSendCap(process.env, win.mode);
+  const { cap: requestedCap, warning: capWarning } = resolveSendCap(process.env, win.mode);
   if (capWarning) console.warn(`[abandonment-anon-lead-email] ${capWarning}`);
+
+  // Dedup safety, before any Supabase or Brevo work. The sent-tracker falls
+  // back to a per-process Set when the KV binding is absent, and on Vercel that
+  // Set is wiped by every cold start — dedup off, normal mode uncapped, the same
+  // marketing email to the same real people every hour. Fail closed there; the
+  // cron erroring out is loud within the hour and sends nothing. Everywhere the
+  // fallback is legitimate (dry runs, a local drain) warn hard and cap instead.
+  const durable = sentTracker.isDurable();
+  const dedup = evaluateDedupSafety({ durable, dryRun, onVercel: !!process.env.VERCEL });
+  const dedupLabel = durable ? 'durable' : 'non-durable';
+
+  if (dedup.action === 'throw') {
+    console.error(`[abandonment-anon-lead-email] ${'='.repeat(72)}`);
+    console.error(`[abandonment-anon-lead-email] REFUSING TO RUN — NON-DURABLE DEDUP ON A REAL SEND`);
+    console.error(`[abandonment-anon-lead-email] ${dedup.reason}`);
+    console.error(`[abandonment-anon-lead-email] ${'='.repeat(72)}`);
+    throw new Error(`Refusing to send with non-durable dedup: ${dedup.reason}`);
+  }
+
+  const cap = capForDedupAction(requestedCap, dedup.action);
   const capLabel = cap === null ? 'none' : String(cap);
+
+  if (dedup.action === 'warn') {
+    console.warn(`[abandonment-anon-lead-email] ${'='.repeat(72)}`);
+    console.warn(`[abandonment-anon-lead-email] NON-DURABLE DEDUP — ${dedup.reason}`);
+    if (cap !== requestedCap) {
+      console.warn(
+        `[abandonment-anon-lead-email] Send cap forced to ${capLabel} for this run ` +
+          `(requested ${requestedCap === null ? 'none' : requestedCap}).`
+      );
+    }
+    console.warn(`[abandonment-anon-lead-email] ${'='.repeat(72)}`);
+  }
 
   const summary = {
     mode: win.mode,
@@ -168,6 +208,7 @@ async function run() {
     windowStart: win.startIso,
     windowEnd: win.endIso,
     cap,
+    dedup: dedupLabel,
     eligible: 0,
     alreadySent: 0,
     remaining: 0,
@@ -181,7 +222,8 @@ async function run() {
   console.log(
     `[abandonment-anon-lead-email] Starting run — mode=${win.mode}` +
       (win.backfillDays ? ` (BACKFILL_DAYS=${win.backfillDays})` : '') +
-      `, window=${win.startIso} → ${win.endIso}, cap=${capLabel}, DRY_RUN=${dryRun}`
+      `, window=${win.startIso} → ${win.endIso}, cap=${capLabel}, dedup=${dedupLabel}, ` +
+      `DRY_RUN=${dryRun}`
   );
 
   let eligible;

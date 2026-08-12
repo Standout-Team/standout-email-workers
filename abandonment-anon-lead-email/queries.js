@@ -23,6 +23,10 @@ const MAX_BACKFILL_DAYS = 30;
 // Backfill cohorts are large; bound the real sends per run so one invocation
 // can't fire a fortnight of email at Brevo (or outrun the function timeout).
 const DEFAULT_BACKFILL_SEND_CAP = 50;
+// Belt-and-suspenders bound for the one non-durable path still allowed to send
+// for real (a local drain, where the process outlives the run). Normal mode is
+// otherwise uncapped, so a dedup slip there would mail the whole cohort.
+const NON_DURABLE_SEND_CAP = 50;
 // Strict: digits with an optional sign. "14.5", "14d" and "" are all invalid.
 const INTEGER_RE = /^[+-]?\d+$/;
 // PostgREST caps a single response; a 30-day backfill can exceed it, so page.
@@ -127,6 +131,69 @@ function resolveSendCap(env = process.env, mode = 'normal') {
   }
 
   return { cap: Number(text), warning: null };
+}
+
+/**
+ * Is it safe to send with the dedup state we actually have? Pure — takes three
+ * booleans the caller has already resolved and returns a decision plus the
+ * reason to log or throw with. No env reads, no network, no logging.
+ *
+ *   durable                        → 'ok'    KV is configured; dedup survives cold starts.
+ *   !durable, real send, on Vercel → 'throw' the dangerous one. Serverless resets the
+ *                                            in-memory Set per instance and per cold
+ *                                            start, so dedup is simply off — and normal
+ *                                            mode is uncapped, so the whole cohort gets
+ *                                            re-mailed every hour, silently.
+ *   !durable, anything else        → 'warn'  a dry run anywhere, or a real send off
+ *                                            Vercel (a local drain), where one process
+ *                                            spans the run and the fallback is honest.
+ *
+ * `onVercel` must be `!!process.env.VERCEL`, which is set on production *and*
+ * preview deployments — a preview carrying DRY_RUN=false and a real Brevo key
+ * mails real people exactly as hard as production does.
+ */
+function evaluateDedupSafety({ durable, dryRun, onVercel }) {
+  if (durable) {
+    return {
+      action: 'ok',
+      reason: 'KV_REST_API_URL / KV_REST_API_TOKEN are set — send-once dedup is durable.',
+    };
+  }
+
+  if (!dryRun && onVercel) {
+    return {
+      action: 'throw',
+      reason:
+        'KV_REST_API_URL / KV_REST_API_TOKEN are not set, so send-once dedup falls back to an ' +
+        'in-memory Set that every serverless instance and cold start resets. Sending for real ' +
+        'from a Vercel deployment in that state re-sends this marketing email to the same real ' +
+        'people on every hourly run, with nothing in the logs to say so. Configure the KV ' +
+        'binding on this project, or set DRY_RUN=true.',
+    };
+  }
+
+  return {
+    action: 'warn',
+    reason:
+      'KV_REST_API_URL / KV_REST_API_TOKEN are not set — send-once dedup is an in-memory Set, ' +
+      'per-process only, so nothing this run records is visible to the next one. Sends are ' +
+      `capped at ${NON_DURABLE_SEND_CAP} for this run, and a real send from a Vercel ` +
+      'deployment will refuse to run until the KV binding is configured.',
+  };
+}
+
+/**
+ * The send cap actually used, given the dedup decision. Pure; `null` means
+ * uncapped. Only the 'warn' path narrows it — to NON_DURABLE_SEND_CAP, or to
+ * whatever the operator already asked for if that is lower.
+ *
+ * Applied in warn-mode dry runs too, so a dry run predicts what a real run in
+ * that same environment would actually send.
+ */
+function capForDedupAction(cap, action) {
+  if (action !== 'warn') return cap;
+  if (cap === null || cap === undefined || !Number.isFinite(cap)) return NON_DURABLE_SEND_CAP;
+  return Math.min(cap, NON_DURABLE_SEND_CAP);
 }
 
 // Newest abandoner first — freshest intent converts best, and it keeps paging
@@ -457,6 +524,8 @@ module.exports = {
   computeWindow,
   resolveSendCap,
   selectForSend,
+  evaluateDedupSafety,
+  capForDedupAction,
   findAnonLeads,
   findFeaturedJobs,
   findExclusions,
@@ -469,6 +538,7 @@ module.exports = {
     MIN_BACKFILL_DAYS,
     MAX_BACKFILL_DAYS,
     DEFAULT_BACKFILL_SEND_CAP,
+    NON_DURABLE_SEND_CAP,
     NORMAL_LOOKBACK_MS,
     SETTLE_MS,
     ONE_DAY_MS,
