@@ -22,6 +22,58 @@ An hourly cron worker that re-engages free users who signed up but went quiet. I
 State is tracked **only** in a local `sent.json` file — the worker performs **zero writes
 to Supabase**.
 
+### `abandonment-anon-lead-email/`
+
+An hourly cron worker that re-engages **anonymous** leads: they uploaded a resume, opted
+in to marketing, hit the paywall and left without ever creating an account. There is no
+account to magic-link them into, so every CTA carries a signed 14-day lead token that
+`/your-match` trades for their restored survey + resume and **one free apply**.
+
+Audience: `surveys` with `marketing_opt_in`, `user_id IS NULL`, a parsed resume carrying a
+plausible email, created inside the run's window (below). Excludes existing `profiles`,
+`marketing_suppressions`, recent `paid|created` `pending_subscriptions`, and anyone with a
+`free_apply_grants` row. The featured job comes from the production
+`match_jobs_for_survey` RPC and is dropped if it closed or went stale (>3 days).
+
+Dedup is **Vercel KV** (`anon_lead_sent:<email_lc>`, stored indefinitely — one send per
+lead email, ever), matching `abandonment-job-email/`. Without `KV_REST_API_URL` /
+`KV_REST_API_TOKEN` it falls back to an in-process `Set`: fine for a local dry run,
+useless in serverless. **Zero writes to Supabase.**
+
+Full spec + ops runbook: `docs/FREE_APPLY_LEADS.md` in the main `Standout-pro` repo.
+
+#### Backfill procedure
+
+By default the worker only looks at surveys created **1–2 hours ago** — an hourly cron
+over a 1-hour-wide window, so each survey is considered exactly once and the audience
+marches forward with the clock. To reach abandoners from *before* the worker went live,
+set two env vars on the Vercel project. **The cron itself never changes.**
+
+| Variable | Effect |
+| --- | --- |
+| `BACKFILL_DAYS` | Widens the window to `[now − N days, now − 1h]`. Integer **1–30**; out-of-range clamps, anything invalid logs a warning and runs the normal window. The backfill window is a *superset* of the normal one, so new abandoners keep being covered while the backlog drains. |
+| `SEND_CAP` | Max real sends per run. Defaults to **50** in backfill mode, uncapped in normal mode. Candidates past the cap are left for the next hourly run. |
+
+1. Set `BACKFILL_DAYS=14` (optionally `SEND_CAP`) with **`DRY_RUN=true`**, and redeploy.
+2. Read the next hourly run's logs. It prints the mode, the exact window bounds, and the
+   cohort — e.g. `312 eligible after exclusions — 0 already sent, 312 remaining, 50
+   selected this run (cap=50, 262 left for later runs)` — then
+   `[DRY RUN COMPLETE] Would send 50 of 312 eligible`. The cohort line lands *before* the
+   per-lead work, so you get the count even if the dry run is slow.
+3. Sanity-check the count and the token/`JOB_URL` self-check lines, then set
+   `DRY_RUN=false` and redeploy.
+4. The cron drains up to `SEND_CAP` per hour, **newest abandoner first** (freshest intent
+   converts best; the tail drains over subsequent runs). Each run logs
+   `N remaining after this run`.
+5. Unset `BACKFILL_DAYS` (and `SEND_CAP`) once `remaining` reaches 0 — or once it stops
+   falling: leads whose top match has gone stale are unmailable, not pending, so the
+   number can plateau above 0.
+
+Safe to run twice. Every send is recorded in KV before the next run reads it, and that
+check now runs in dry-run mode too — so a dry run *after* a partial drain reports the true
+remaining cohort instead of re-counting people who were already mailed. If a run times
+out, lower `SEND_CAP`.
+
 ---
 
 ## Setup

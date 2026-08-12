@@ -1,6 +1,6 @@
 require('dotenv').config();
 
-const { findAnonLeads, findFeaturedJobs } = require('./queries');
+const { computeWindow, resolveSendCap, selectForSend, findAnonLeads, findFeaturedJobs } = require('./queries');
 const { generateMatchReasons } = require('./match-reason');
 const { sendJobEmail } = require('./brevo');
 const { signLeadToken, decodeLeadToken } = require('./lead-token');
@@ -13,6 +13,11 @@ const sentTracker = require('./sent-tracker');
 // have no account, so there is nothing to magic-link them into. Instead every
 // CTA carries a signed lead token that /your-match trades for their restored
 // survey + resume and one free apply.
+//
+// Two modes, both on the same hourly cron and selected purely by env vars:
+// normal (the 1–2h-ago cohort) and backfill (BACKFILL_DAYS, capped by
+// SEND_CAP, newest-first, drained cap-per-hour). See computeWindow in
+// queries.js and the "Backfill procedure" section of the repo README.
 // ---------------------------------------------------------------------------
 
 const UTM = {
@@ -20,6 +25,10 @@ const UTM = {
   utm_medium: 'email',
   utm_campaign: 'anon_lead',
 };
+
+// Sent-tracker lookups are one KV round-trip each; a backfill cohort is big
+// enough that doing them serially would eat the invocation.
+const KV_CHECK_CHUNK = 20;
 
 function isDryRun() {
   return String(process.env.DRY_RUN).toLowerCase() !== 'false';
@@ -104,33 +113,123 @@ function buildPayload(lead, job, pct, reasons, links) {
   };
 }
 
+/**
+ * Split the cohort on the persistent sent-tracker, preserving order. This runs
+ * in **both** modes and before the send cap, so (a) a dry run reports the true
+ * remaining cohort rather than re-counting a partially drained one, and (b) each
+ * run spends its cap on leads that can actually be mailed.
+ *
+ * A tracker lookup that throws defers the lead to the next run — the failure
+ * mode of guessing "unsent" is a duplicate marketing email.
+ */
+async function partitionBySentTracker(leads) {
+  const unsent = [];
+  let alreadySent = 0;
+  let trackerErrors = 0;
+
+  for (let i = 0; i < leads.length; i += KV_CHECK_CHUNK) {
+    const chunk = leads.slice(i, i + KV_CHECK_CHUNK);
+    const states = await Promise.all(
+      chunk.map(async (lead) => {
+        try {
+          return (await sentTracker.hasBeenSent(lead.email_lc)) ? 'sent' : 'unsent';
+        } catch (err) {
+          console.error(
+            `[abandonment-anon-lead-email] sent-tracker lookup failed for ${lead.email_lc}, deferring:`,
+            err.message
+          );
+          return 'error';
+        }
+      })
+    );
+
+    states.forEach((state, idx) => {
+      if (state === 'unsent') unsent.push(chunk[idx]);
+      else if (state === 'sent') alreadySent++;
+      else trackerErrors++;
+    });
+  }
+
+  return { unsent, alreadySent, trackerErrors };
+}
+
 async function run() {
   const dryRun = isDryRun();
-  console.log(`[abandonment-anon-lead-email] Starting run — DRY_RUN=${dryRun}`);
 
-  let leads;
+  const win = computeWindow(Date.now(), process.env);
+  if (win.warning) console.warn(`[abandonment-anon-lead-email] ${win.warning}`);
+  const { cap, warning: capWarning } = resolveSendCap(process.env, win.mode);
+  if (capWarning) console.warn(`[abandonment-anon-lead-email] ${capWarning}`);
+  const capLabel = cap === null ? 'none' : String(cap);
+
+  const summary = {
+    mode: win.mode,
+    backfillDays: win.backfillDays,
+    windowStart: win.startIso,
+    windowEnd: win.endIso,
+    cap,
+    eligible: 0,
+    alreadySent: 0,
+    remaining: 0,
+    selected: 0,
+    deferred: 0,
+    sent: 0,
+    skipped: 0,
+    dryRun,
+  };
+
+  console.log(
+    `[abandonment-anon-lead-email] Starting run — mode=${win.mode}` +
+      (win.backfillDays ? ` (BACKFILL_DAYS=${win.backfillDays})` : '') +
+      `, window=${win.startIso} → ${win.endIso}, cap=${capLabel}, DRY_RUN=${dryRun}`
+  );
+
+  let eligible;
   try {
-    leads = await findAnonLeads();
+    eligible = await findAnonLeads(win);
   } catch (err) {
     console.error('[abandonment-anon-lead-email] Supabase query failed, aborting run:', err.message);
     throw err;
   }
+  summary.eligible = eligible.length;
 
-  if (leads.length === 0) {
+  if (eligible.length === 0) {
     console.log('[abandonment-anon-lead-email] No eligible leads in this window.');
-    return { eligible: 0, sent: 0, skipped: 0, dryRun };
+    return summary;
+  }
+
+  const { unsent, alreadySent, trackerErrors } = await partitionBySentTracker(eligible);
+  const { selected, deferred } = selectForSend(unsent, cap);
+  Object.assign(summary, {
+    alreadySent,
+    remaining: unsent.length,
+    selected: selected.length,
+    deferred,
+  });
+
+  console.log(
+    `[abandonment-anon-lead-email] ${eligible.length} eligible after exclusions — ` +
+      `${alreadySent} already sent, ${unsent.length} remaining, ${selected.length} selected this run ` +
+      `(cap=${capLabel}, ${deferred} left for later runs).`
+  );
+
+  if (selected.length === 0) {
+    console.log('[abandonment-anon-lead-email] Nothing left to send in this window.');
+    summary.skipped = trackerErrors;
+    return summary;
   }
 
   let sendable;
   try {
-    sendable = await findFeaturedJobs(leads);
+    sendable = await findFeaturedJobs(selected);
   } catch (err) {
     console.error('[abandonment-anon-lead-email] Featured-job lookup failed, aborting:', err.message);
     throw err;
   }
 
   let sentCount = 0;
-  let skipped = leads.length - sendable.length; // leads with no fresh match
+  // leads with a failed tracker lookup + leads with no fresh match
+  let skipped = trackerErrors + (selected.length - sendable.length);
 
   for (const { lead, job, pct } of sendable) {
     try {
@@ -159,9 +258,11 @@ async function run() {
         continue;
       }
 
-      // One send per lead email, ever — also guards overlapping cron runs.
-      const alreadySent = await sentTracker.hasBeenSent(lead.email_lc);
-      if (alreadySent) {
+      // One send per lead email, ever. partitionBySentTracker already dropped
+      // the known-sent; this re-check closes the window between that partition
+      // and this send (overlapping cron runs, a long backfill invocation).
+      const alreadyMailed = await sentTracker.hasBeenSent(lead.email_lc);
+      if (alreadyMailed) {
         console.log(`[abandonment-anon-lead-email] Already sent to ${lead.email_lc}, skipping.`);
         skipped++;
         continue;
@@ -179,13 +280,25 @@ async function run() {
     }
   }
 
+  Object.assign(summary, { sent: sentCount, skipped });
+
   if (dryRun) {
-    console.log(`[DRY RUN COMPLETE] Would have sent ${sentCount} emails (${skipped} skipped).`);
+    console.log(
+      `[DRY RUN COMPLETE] Would send ${sentCount} of ${unsent.length} eligible — ` +
+        `cap=${capLabel}; ${eligible.length} in window after exclusions, ${alreadySent} already sent, ` +
+        `${deferred} left for later runs, ${skipped} skipped.`
+    );
   } else {
-    console.log(`[abandonment-anon-lead-email] Run complete — sent ${sentCount}, skipped ${skipped}.`);
+    // `remaining` is the number the operator watches to decide when to unset
+    // BACKFILL_DAYS. It plateaus rather than reaching 0 when the tail has no
+    // fresh job match — those leads are unmailable, not pending.
+    console.log(
+      `[abandonment-anon-lead-email] Run complete — mode=${win.mode}, sent ${sentCount}, ` +
+        `skipped ${skipped}, ${Math.max(0, unsent.length - sentCount)} remaining after this run.`
+    );
   }
 
-  return { eligible: leads.length, sent: sentCount, skipped, dryRun };
+  return summary;
 }
 
 // Vercel serverless handler — mounted at /api/abandonment-anon-lead-email

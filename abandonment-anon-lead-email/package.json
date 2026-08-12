@@ -6,7 +6,8 @@
   "type": "commonjs",
   "scripts": {
     "start": "node index.js",
-    "dry-run": "DRY_RUN=true node index.js"
+    "dry-run": "DRY_RUN=true node index.js",
+    "test": "node --test"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.27.0",

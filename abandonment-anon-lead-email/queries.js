@@ -1,6 +1,7 @@
 const { createClient } = require('@supabase/supabase-js');
 
 const ONE_HOUR_MS = 60 * 60 * 1000;
+const ONE_DAY_MS = 24 * ONE_HOUR_MS;
 const THREE_DAYS_MS = 3 * 24 * 60 * 60 * 1000;
 const SEVEN_DAYS_MS = 7 * 24 * 60 * 60 * 1000;
 // pending_subscriptions rows in these states mean the lead is already in the
@@ -9,6 +10,24 @@ const CHECKOUT_STATUSES = ['paid', 'created'];
 // Per-email ilike counts are one request each; keep the fan-out polite.
 const ILIKE_CHUNK = 10;
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+
+// --- Window / backfill configuration -------------------------------------
+// Leads get one quiet hour before we mail them; that upper bound never moves,
+// in either mode.
+const SETTLE_MS = ONE_HOUR_MS;
+// Normal mode looks back exactly one hour further, so the hourly cron considers
+// every survey exactly once.
+const NORMAL_LOOKBACK_MS = 2 * ONE_HOUR_MS;
+const MIN_BACKFILL_DAYS = 1;
+const MAX_BACKFILL_DAYS = 30;
+// Backfill cohorts are large; bound the real sends per run so one invocation
+// can't fire a fortnight of email at Brevo (or outrun the function timeout).
+const DEFAULT_BACKFILL_SEND_CAP = 50;
+// Strict: digits with an optional sign. "14.5", "14d" and "" are all invalid.
+const INTEGER_RE = /^[+-]?\d+$/;
+// PostgREST caps a single response; a 30-day backfill can exceed it, so page.
+const SURVEY_PAGE_SIZE = 1000;
+const MAX_SURVEY_PAGES = 25;
 
 let _client = null;
 
@@ -22,6 +41,116 @@ function getSupabase() {
     auth: { persistSession: false },
   });
   return _client;
+}
+
+/**
+ * The survey `created_at` window, in both modes. Pure — takes the clock and the
+ * env, returns bounds plus a `warning` string for the caller to log (never logs
+ * itself, so it stays unit-testable and can't double-warn).
+ *
+ *   normal    [now − 2h, now − 1h]              (BACKFILL_DAYS unset/invalid)
+ *   backfill  [now − BACKFILL_DAYS d, now − 1h] (1–30, clamped)
+ *
+ * The backfill window is a strict superset of the normal one — same upper
+ * bound — so new abandoners keep being covered while a backfill drains.
+ * Anything that isn't a plain integer ≥ 1 falls back to normal mode with a
+ * warning; a value above the maximum is clamped rather than rejected.
+ */
+function computeWindow(nowMs, env = process.env) {
+  const endMs = nowMs - SETTLE_MS;
+  const normal = {
+    mode: 'normal',
+    backfillDays: null,
+    startMs: nowMs - NORMAL_LOOKBACK_MS,
+    endMs,
+    warning: null,
+  };
+  const withIso = (win) => ({
+    ...win,
+    startIso: new Date(win.startMs).toISOString(),
+    endIso: new Date(win.endMs).toISOString(),
+  });
+
+  const raw = env.BACKFILL_DAYS;
+  if (raw === undefined || raw === null || String(raw).trim() === '') return withIso(normal);
+
+  const text = String(raw).trim();
+  if (!INTEGER_RE.test(text)) {
+    return withIso({
+      ...normal,
+      warning: `BACKFILL_DAYS="${text}" is not an integer — falling back to the normal 1–2h window.`,
+    });
+  }
+
+  const requested = Number(text);
+  if (requested < MIN_BACKFILL_DAYS) {
+    return withIso({
+      ...normal,
+      warning:
+        `BACKFILL_DAYS=${requested} is below the minimum of ${MIN_BACKFILL_DAYS} — ` +
+        'falling back to the normal 1–2h window.',
+    });
+  }
+
+  const days = Math.min(requested, MAX_BACKFILL_DAYS);
+  return withIso({
+    mode: 'backfill',
+    backfillDays: days,
+    startMs: nowMs - days * ONE_DAY_MS,
+    endMs,
+    warning:
+      days === requested
+        ? null
+        : `BACKFILL_DAYS=${requested} exceeds the maximum of ${MAX_BACKFILL_DAYS} — clamped to ${days}.`,
+  });
+}
+
+/**
+ * Max real sends per run. Pure, same warning contract as computeWindow.
+ * Explicit SEND_CAP wins in either mode; otherwise backfill runs get the
+ * default cap and normal mode is uncapped (`null`) because hourly cohorts are
+ * small. Anything that isn't a positive integer falls back to the default.
+ */
+function resolveSendCap(env = process.env, mode = 'normal') {
+  const fallback = mode === 'backfill' ? DEFAULT_BACKFILL_SEND_CAP : null;
+  const raw = env.SEND_CAP;
+  if (raw === undefined || raw === null || String(raw).trim() === '') return { cap: fallback, warning: null };
+
+  const text = String(raw).trim();
+  if (!INTEGER_RE.test(text) || Number(text) < 1) {
+    return {
+      cap: fallback,
+      warning:
+        `SEND_CAP="${text}" is not a positive integer — using ` +
+        `${fallback === null ? 'no cap' : `the default of ${fallback}`}.`,
+    };
+  }
+
+  return { cap: Number(text), warning: null };
+}
+
+// Newest abandoner first — freshest intent converts best, and it keeps paging
+// stable (survey id breaks created_at ties).
+function byCreatedAtDesc(a, b) {
+  const ta = new Date(a.created_at).getTime() || 0;
+  const tb = new Date(b.created_at).getTime() || 0;
+  if (tb !== ta) return tb - ta;
+  return String(b.survey_id ?? '').localeCompare(String(a.survey_id ?? ''));
+}
+
+/**
+ * Order a cohort newest-first and take the run's slice. Pure; never mutates the
+ * input. `cap` of null/undefined/Infinity means uncapped. Everything past the
+ * cap is `deferred` — the next hourly run picks it up, and the persistent
+ * sent-tracker keeps the already-mailed head out of that run's cohort.
+ */
+function selectForSend(candidates, cap) {
+  const ordered = [...candidates].sort(byCreatedAtDesc);
+  if (cap === null || cap === undefined || !Number.isFinite(cap)) {
+    return { selected: ordered, deferred: 0 };
+  }
+  const take = Math.max(0, Math.min(Math.trunc(cap), ordered.length));
+  return { selected: ordered.slice(0, take), deferred: ordered.length - take };
 }
 
 /**
@@ -169,39 +298,80 @@ async function findExclusions(candidates) {
 }
 
 /**
- * The audience: anonymous, opted-in surveys with a parsed resume that carries a
- * plausible email, created 1–2 hours ago. Hourly cron × 1-hour-wide window =
- * every survey is considered exactly once.
+ * Every opted-in anonymous survey in the window, newest first. Paged, because a
+ * long backfill window can hold more rows than PostgREST returns in one
+ * response — silently truncating would wedge the drain (the newest page would
+ * always come back already-sent and the tail would never be reached).
  */
-async function findAnonLeads() {
+async function fetchSurveyRows(win) {
   const supabase = getSupabase();
+  const rows = [];
 
-  const windowStart = new Date(Date.now() - 2 * ONE_HOUR_MS).toISOString(); // 2 hours ago
-  const windowEnd = new Date(Date.now() - ONE_HOUR_MS).toISOString();       // 1 hour ago
+  for (let page = 0; page < MAX_SURVEY_PAGES; page++) {
+    const from = page * SURVEY_PAGE_SIZE;
+    const { data, error } = await supabase
+      .from('surveys')
+      .select('id, session_id, resume_parsed, created_at, marketing_opt_in_at')
+      .eq('marketing_opt_in', true)
+      .is('user_id', null)
+      .not('resume_parsed', 'is', null)
+      .gte('created_at', win.startIso)
+      .lte('created_at', win.endIso)
+      .order('created_at', { ascending: false })
+      .order('id', { ascending: false }) // total order — stable paging across ties
+      .range(from, from + SURVEY_PAGE_SIZE - 1);
 
-  const { data: rows, error } = await supabase
-    .from('surveys')
-    .select('id, session_id, resume_parsed, created_at, marketing_opt_in_at')
-    .eq('marketing_opt_in', true)
-    .is('user_id', null)
-    .not('resume_parsed', 'is', null)
-    .gte('created_at', windowStart)
-    .lte('created_at', windowEnd);
+    if (error) throw new Error(`surveys query failed: ${error.message}`);
 
-  if (error) throw new Error(`surveys query failed: ${error.message}`);
+    const batch = data || [];
+    rows.push(...batch);
+    if (batch.length < SURVEY_PAGE_SIZE) return rows;
+  }
+
+  console.warn(
+    `[queries] survey paging hit the ${MAX_SURVEY_PAGES}-page guard at ${rows.length} row(s) — ` +
+      'lower BACKFILL_DAYS and drain in slices.'
+  );
+  return rows;
+}
+
+/**
+ * The audience: anonymous, opted-in surveys with a parsed resume that carries a
+ * plausible email, in one of two windows (see computeWindow):
+ *
+ *   normal mode   — created 1–2 hours ago. Hourly cron × 1-hour-wide window =
+ *                   every survey is considered exactly once.
+ *   backfill mode — BACKFILL_DAYS is set: created between BACKFILL_DAYS ago and
+ *                   1 hour ago, i.e. a superset of the normal window, so the
+ *                   forward-marching hourly cohort is still covered while the
+ *                   backlog drains. Surveys are then reconsidered on every run;
+ *                   the persistent sent-tracker (KV) is what makes that
+ *                   idempotent, and SEND_CAP is what keeps one run bounded.
+ *
+ * Everything downstream is age-independent and unchanged in both modes: the
+ * exclusion set, the 3-day job-freshness gate, and the send-time token mint.
+ * Returned newest-first. Pass `windowOverride` (from computeWindow) when the
+ * caller has already resolved and logged the window.
+ */
+async function findAnonLeads(windowOverride) {
+  const win = windowOverride || computeWindow(Date.now(), process.env);
+  if (!windowOverride && win.warning) console.warn(`[queries] ${win.warning}`);
+
+  const rows = await fetchSurveyRows(win);
 
   // One lead per lower(email) — latest consent wins.
   const byEmail = new Map();
-  for (const row of rows || []) {
+  for (const row of rows) {
     const lead = leadFromSurvey(row);
     if (!lead) continue;
     const prev = byEmail.get(lead.email_lc);
     if (!prev || optInTime(lead) >= optInTime(prev)) byEmail.set(lead.email_lc, lead);
   }
 
-  const candidates = [...byEmail.values()];
+  const candidates = [...byEmail.values()].sort(byCreatedAtDesc);
   console.log(
-    `[queries] ${(rows || []).length} opted-in anonymous survey(s) in window → ${candidates.length} candidate lead(s).`
+    `[queries] mode=${win.mode} window=${win.startIso} → ${win.endIso}: ` +
+      `${rows.length} opted-in anonymous survey(s) → ${candidates.length} candidate lead(s).`
   );
   if (candidates.length === 0) return [];
 
@@ -284,8 +454,23 @@ async function findFeaturedJobs(leads) {
 
 module.exports = {
   getSupabase,
+  computeWindow,
+  resolveSendCap,
+  selectForSend,
   findAnonLeads,
   findFeaturedJobs,
   findExclusions,
-  _internals: { parseResume, leadFromSurvey, optInTime, escapeLike },
+  _internals: {
+    parseResume,
+    leadFromSurvey,
+    optInTime,
+    escapeLike,
+    byCreatedAtDesc,
+    MIN_BACKFILL_DAYS,
+    MAX_BACKFILL_DAYS,
+    DEFAULT_BACKFILL_SEND_CAP,
+    NORMAL_LOOKBACK_MS,
+    SETTLE_MS,
+    ONE_DAY_MS,
+  },
 };
