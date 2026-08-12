@@ -477,18 +477,36 @@ async function findFeaturedJobs(leads) {
           continue;
         }
 
-        // RPC returns rows ordered by total_score DESC — use the first valid job.
-        for (const match of matches) {
-          const { data: job, error: jobError } = await supabase
-            .from('jobs')
-            .select(
-              'id, title, company, location, salary_min, salary_max, work_type, source_url, description, role_category, first_seen_at, last_seen_at, ats_provider, closed_at'
-            )
-            .eq('id', match.job_id)
-            .single();
+        // Hydrate the whole window's matches in ONE round trip rather than up
+        // to 10 sequential .single() calls. The ladder means the worst case per
+        // lead was 4 windows x 10 fetches = 40 round trips, all inside the
+        // Promise.all that fans out across the entire cohort — and the leads
+        // that reach the widest windows are exactly what a backfill run is made
+        // of. A row that is missing simply isn't in the map, which lands on the
+        // same `continue` the per-row error did.
+        const { data: jobRows, error: jobError } = await supabase
+          .from('jobs')
+          .select(
+            'id, title, company, location, salary_min, salary_max, work_type, source_url, description, role_category, first_seen_at, last_seen_at, ats_provider, closed_at'
+          )
+          .in(
+            'id',
+            matches.map((m) => m.job_id)
+          );
 
-          if (jobError || !job) {
-            console.error(`[queries] job fetch failed for job ${match.job_id}: ${jobError?.message}`);
+        if (jobError) {
+          console.error(`[queries] job fetch failed for ${lead.email_lc}: ${jobError.message}`);
+          return null;
+        }
+        const jobsById = new Map((jobRows || []).map((j) => [j.id, j]));
+
+        // Iterate MATCHES, not jobsById — the RPC returns rows ordered by
+        // total_score DESC and `.in()` gives no ordering guarantee, so the map
+        // lookup is what preserves "best match first".
+        for (const match of matches) {
+          const job = jobsById.get(match.job_id);
+          if (!job) {
+            console.error(`[queries] job ${match.job_id} missing from the batch fetch — skipping.`);
             continue;
           }
           if (job.closed_at) {
