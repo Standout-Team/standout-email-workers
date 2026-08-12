@@ -1,9 +1,12 @@
 {
-  "name": "standout-email-workers",
+  "name": "abandonment-anon-lead-email",
   "version": "1.0.0",
-  "description": "Hourly abandoned-user job recommendation worker for Standout",
+  "description": "Hourly worker that emails anonymous opted-in leads their top job match with a one-free-apply landing link via Brevo",
+  "main": "index.js",
   "type": "commonjs",
   "scripts": {
+    "start": "node index.js",
+    "dry-run": "DRY_RUN=true node index.js",
     "test": "node --test"
   },
   "dependencies": {
