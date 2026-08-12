@@ -2,7 +2,7 @@ const { createClient } = require('@supabase/supabase-js');
 
 const ONE_HOUR_MS = 60 * 60 * 1000;
 const ONE_DAY_MS = 24 * ONE_HOUR_MS;
-const THREE_DAYS_MS = 3 * 24 * 60 * 60 * 1000;
+const FRESH_DAY_STEPS = [3, 7, 14, 30];
 const SEVEN_DAYS_MS = 7 * 24 * 60 * 60 * 1000;
 // pending_subscriptions rows in these states mean the lead is already in the
 // pay-then-setup recovery flow — a different email owns them.
@@ -451,8 +451,8 @@ async function findAnonLeads(windowOverride) {
 
 /**
  * Featured job per lead, via the same production RPC the in-app matches feed
- * uses (HNSW vector search + structured boosts). Top row wins; the lead is
- * dropped when there's no match, the posting closed, or it went stale.
+ * uses (HNSW vector search + structured boosts). It progressively relaxes the
+ * freshness window until it finds a non-closed match.
  *
  * Returns [{ lead, job, pct }] in input order.
  */
@@ -461,58 +461,59 @@ async function findFeaturedJobs(leads) {
 
   const results = await Promise.all(
     leads.map(async (lead) => {
-      const { data: matches, error: rpcError } = await supabase.rpc('match_jobs_for_survey', {
-        p_survey_id: lead.survey_id,
-        p_limit: 10,
-        p_fresh_days: 3,
-      });
+      for (const freshDays of FRESH_DAY_STEPS) {
+        const { data: matches, error: rpcError } = await supabase.rpc('match_jobs_for_survey', {
+          p_survey_id: lead.survey_id,
+          p_limit: 10,
+          p_fresh_days: freshDays,
+        });
 
-      if (rpcError) {
-        console.error(`[queries] match_jobs_for_survey failed for ${lead.email_lc}: ${rpcError.message}`);
-        return null;
-      }
-      if (!matches || matches.length === 0) {
-        console.log(`[queries] No fresh matches for ${lead.email_lc} — skipping.`);
-        return null;
-      }
+        if (rpcError) {
+          console.error(`[queries] match_jobs_for_survey failed for ${lead.email_lc}: ${rpcError.message}`);
+          return null;
+        }
+        if (!matches || matches.length === 0) {
+          console.log(`[queries] No matches within ${freshDays}d for ${lead.email_lc}; trying next window.`);
+          continue;
+        }
 
-      // RPC returns rows ordered by total_score DESC — the first is the best.
-      const topMatch = matches[0];
+        // RPC returns rows ordered by total_score DESC — use the first valid job.
+        for (const match of matches) {
+          const { data: job, error: jobError } = await supabase
+            .from('jobs')
+            .select(
+              'id, title, company, location, salary_min, salary_max, work_type, source_url, description, role_category, first_seen_at, last_seen_at, ats_provider, closed_at'
+            )
+            .eq('id', match.job_id)
+            .single();
 
-      const { data: job, error: jobError } = await supabase
-        .from('jobs')
-        .select(
-          'id, title, company, location, salary_min, salary_max, work_type, source_url, description, role_category, first_seen_at, last_seen_at, ats_provider, closed_at'
-        )
-        .eq('id', topMatch.job_id)
-        .single();
+          if (jobError || !job) {
+            console.error(`[queries] job fetch failed for job ${match.job_id}: ${jobError?.message}`);
+            continue;
+          }
+          if (job.closed_at) {
+            console.log(`[queries] Job ${job.id} is closed — trying next match for ${lead.email_lc}.`);
+            continue;
+          }
 
-      if (jobError || !job) {
-        console.error(`[queries] job fetch failed for job ${topMatch.job_id}: ${jobError?.message}`);
-        return null;
-      }
-      if (job.closed_at) {
-        console.log(`[queries] Job ${job.id} is closed — skipping ${lead.email_lc}.`);
-        return null;
-      }
+          // Mirrors visibleMatchPct in the main repo (server/marketing/match-digest.ts).
+          const pct = Math.max(70, Math.min(98, Math.round(70 + match.total_score * 28)));
 
-      const ageMs = Date.now() - new Date(job.last_seen_at).getTime();
-      if (!(ageMs <= THREE_DAYS_MS)) {
+          console.log(
+            `[queries] ${lead.email_lc} → "${job.title}" at ${job.company} ` +
+              `(${pct}% match, score=${match.total_score.toFixed(3)}, freshness=${freshDays}d)`
+          );
+
+          return { lead, job, pct };
+        }
+
         console.log(
-          `[queries] Top match for ${lead.email_lc} last seen ${Math.round(ageMs / (24 * 60 * 60 * 1000))}d ago — skipping.`
+          `[queries] No open matches within ${freshDays}d for ${lead.email_lc}; trying next window.`
         );
-        return null;
       }
 
-      // Mirrors visibleMatchPct in the main repo (server/marketing/match-digest.ts).
-      const pct = Math.max(70, Math.min(98, Math.round(70 + topMatch.total_score * 28)));
-
-      console.log(
-        `[queries] ${lead.email_lc} → "${job.title}" at ${job.company} ` +
-          `(${pct}% match, score=${topMatch.total_score.toFixed(3)})`
-      );
-
-      return { lead, job, pct };
+      console.log(`[queries] No open matches within 30d for ${lead.email_lc} — skipping.`);
+      return null;
     })
   );
 
