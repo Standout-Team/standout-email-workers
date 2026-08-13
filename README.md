@@ -6,21 +6,9 @@ never touches the main Standout app codebase.
 
 ## Workers
 
-### `abandonment-job-email/`
-
-An hourly cron worker that re-engages free users who signed up but went quiet. It:
-
-1. Finds free users (no active/trialing subscription) who registered **1+ hour ago** and
-   have a parsed resume.
-2. Picks the single **best untouched job match** for each from their existing match queue
-   — highest `pct`, excluding the rank 0/1/2 jobs already shown in-app, and only jobs seen
-   in the last 7 days.
-3. Generates 3 specific "why you match" bullet points with Claude Haiku (with a graceful
-   non-AI fallback).
-4. Sends a transactional email via a Brevo template.
-
-State is tracked **only** in a local `sent.json` file — the worker performs **zero writes
-to Supabase**.
+`abandonment-anon-lead-email/` is the only worker with a live endpoint and cron. Three
+older workers were retired on 2026-08-13 — their code is still in-tree but they no longer
+run; see [Retired workers](#retired-workers).
 
 ### `abandonment-anon-lead-email/`
 
@@ -202,49 +190,114 @@ If nothing sends, the logs name the reason rather than making you guess:
 
 ---
 
+## Retired workers
+
+Retired **2026-08-13**, after the workers' creator confirmed they are no longer needed:
+
+| Worker | Was scheduled | State at retirement |
+| --- | --- | --- |
+| `abandonment-job-email/` | hourly (`0 * * * *`) | Ran clean, **actively sending** — the 21:00 UTC run on 2026-08-13 found 2 users and sent 2 real emails |
+| `abandonment-job-email-2/` | hourly (`0 * * * *`) | **Already broken** — 500 on every run with `TypeError: sentTracker.getSentJobId is not a function` at `abandonment-job-email-2/queries.js:63`, a casualty of the `sent.json` → Vercel KV migration (`sent-tracker.js` exports only `hasBeenSent` / `markSent`) |
+| `abandonment-job-email-resume-trigger/` | every 10 min (`*/10 * * * *`) | Ran clean, same live audience as `abandonment-job-email/` (deduped separately) |
+
+> **Spot checks showed "0 eligible users" — that was sampling, not an empty audience.**
+> The shared audience ran ~24 eligible people/day (167 over the 7 days to 2026-08-13),
+> and only about **half** of hourly windows contained anyone, so checking a few runs in a
+> row could easily show none. These were retired because they duplicate the anon-lead
+> worker's cohort and `-2` was dead — not because nobody was there.
+
+### This is a coverage change, not a replacement
+
+All three queried `profiles` and emailed **people who already have accounts**, minting
+auto-login magic links. `abandonment-anon-lead-email/` deliberately targets the opposite
+audience — it **excludes** anyone present in `profiles` — so it does not pick these people
+up and never will. Retiring these three means that audience stops receiving these emails.
+That was the intent.
+
+Sized, over the 7 days to 2026-08-13: **167 people** were eligible (~24/day). **98** of
+them had also been anonymous opted-in leads before signing up, so the anon-lead worker had
+already emailed them — retiring these three only stops the *second* email for that group.
+The other **69** (~10/day) signed up without ever being an anonymous lead, so nothing
+emails them now. That is the real cost of this change.
+
+### What was deleted, and why the entry point and not just the cron
+
+Only the three `api/*.js` entry points, plus their three `vercel.json` cron entries in the
+same commit.
+
+**Removing a cron entry does not disable a worker.** There is no auth anywhere in this
+repo — no `CRON_SECRET`, no `x-vercel-cron` check, no `Authorization` check — and each
+`api/*.js` ran a real send on any `GET`. Unscheduling alone would have left three live,
+unauthenticated URLs still capable of sending real marketing email to anyone who opened
+them. Deleting the entry points is what actually turns them off: the endpoints are gone,
+so they can no longer be triggered by URL.
+
+### Restoring one
+
+The three worker directories are **untouched** and still hold all their logic — that is
+where reversibility lives. A restore is two small pieces:
+
+1. Recreate `api/<worker-name>.js` re-exporting the worker:
+   ```js
+   module.exports = require('../abandonment-job-email/index.js');
+   ```
+   (`abandonment-job-email-2` used a longer handler calling its exported `run()`; recover
+   the exact file from history — `git log --diff-filter=D --stat -- api/`.)
+2. Add its entry back to the `crons` array in [`vercel.json`](./vercel.json), then redeploy.
+
+`abandonment-job-email-2` also needs its `getSentJobId` bug fixed before it can do anything
+but 500 — `sent-tracker.js` needs a reader that returns the stored `jobId`.
+
+---
+
 ## Setup
 
 ```bash
 git clone https://github.com/gregdavies-star/standout-email-workers.git
-cd standout-email-workers/abandonment-job-email
+cd standout-email-workers/abandonment-anon-lead-email
 npm install
 cp .env.example .env   # then fill in the values
 ```
 
 ### Environment variables
 
-| Variable               | Purpose                                                        |
-| ---------------------- | -------------------------------------------------------------- |
-| `SUPABASE_URL`         | Supabase project URL                                           |
-| `SUPABASE_SERVICE_KEY` | Service role key (read access is all that's needed)            |
-| `BREVO_API_KEY`        | Brevo API key                                                  |
-| `BREVO_TEMPLATE_ID`    | ID of the Brevo transactional template (placeholder until made)|
-| `ANTHROPIC_API_KEY`    | Anthropic key for match-pitch generation                       |
-| `STANDOUT_APP_URL`     | Base URL for job/matches links (default `https://standout.jobs`)|
-| `DRY_RUN`              | `true` (default) logs only; `false` sends live emails          |
+These configure `abandonment-anon-lead-email/`, the only worker that still runs.
+`abandonment-anon-lead-email/.env.example` is the full annotated list; the core ones:
 
-> The Brevo template does not exist yet. Leave `BREVO_TEMPLATE_ID` as a placeholder while
-> testing in dry-run mode — the worker fails with a clear error if a live send is attempted
-> without it.
+| Variable                      | Purpose                                                       |
+| ----------------------------- | ------------------------------------------------------------- |
+| `SUPABASE_URL`                | Supabase project URL                                          |
+| `SUPABASE_SERVICE_KEY`        | Service role key (read access is all that's needed)           |
+| `BREVO_API_KEY`               | Brevo API key                                                 |
+| `BREVO_TEMPLATE_ID_ANON_LEAD` | Brevo transactional template for the anon-lead email          |
+| `ANTHROPIC_API_KEY`           | Anthropic key for match-pitch generation                      |
+| `STANDOUT_APP_URL`            | Base URL for the `/your-match` landing page                   |
+| `EMAIL_LINK_SECRET`           | HMAC secret for the lead token — must match the main app's    |
+| `KV_REST_API_URL` / `_TOKEN`  | Vercel KV send-once dedup. **Required on Vercel** (fail-closed)|
+| `DRY_RUN`                     | `true` (default) logs only; `false` sends live emails. Scoped to this worker alone — the retired workers read their own copies of it and no longer run. |
+
+Tuning and operational vars (`BACKFILL_DAYS`, `SEND_CAP`, `MATCH_CONCURRENCY`,
+`RUN_BUDGET_MS`, `MATCH_ROLE_FANOUT`, `TARGET_EMAILS`) are documented in their own sections
+above.
 
 ---
 
 ## Run locally (dry run)
 
 Dry run is the default. It logs every email it *would* send, makes **no** Brevo calls, and
-does **not** write to `sent.json`:
+does **not** touch KV:
 
 ```bash
-cd abandonment-job-email
+cd abandonment-anon-lead-email
 DRY_RUN=true node index.js
 ```
 
 You'll see lines like:
 
 ```
-[DRY RUN] Would send to: jane@example.com — Job: Sales Associate at Instacart (rank 5, 88% match, Posted 2 days ago)
+[DRY RUN] Would send to: jane@example.com — Job: Sales Associate at Instacart (88% match, Posted 2 days ago)
 [DRY RUN] Brevo params: { ... }
-[DRY RUN COMPLETE] Would have sent 3 emails (1 skipped).
+[DRY RUN COMPLETE] Would send 3 of 4 eligible
 ```
 
 To send for real locally, set `DRY_RUN=false` in `.env`.
@@ -253,13 +306,13 @@ To send for real locally, set `DRY_RUN=false` in `.env`.
 
 ## Deploy to Vercel
 
-The repo is Vercel-ready. The cron schedule lives in [`vercel.json`](./vercel.json) and
-runs hourly (`0 * * * *`), hitting the serverless handler at
-`/api/abandonment-job-email`.
+The repo is Vercel-ready. The one remaining cron lives in [`vercel.json`](./vercel.json)
+and runs hourly (`0 * * * *`), hitting the serverless handler at
+`/api/abandonment-anon-lead-email` (given 300s of `maxDuration` by the `functions` block).
 
 1. Import the repo into Vercel.
-2. Add every variable from `.env.example` under **Project → Settings → Environment
-   Variables**. Keep `DRY_RUN=true` for the first deploys.
+2. Add every variable from `abandonment-anon-lead-email/.env.example` under **Project →
+   Settings → Environment Variables**. Keep `DRY_RUN=true` for the first deploys.
 3. Deploy. The cron will appear under **Project → Cron Jobs**.
 
 ### Flip to live sends
@@ -267,11 +320,10 @@ runs hourly (`0 * * * *`), hitting the serverless handler at
 When you're confident in the dry-run output, set `DRY_RUN=false` in the Vercel
 environment variables and redeploy.
 
-> **Note on dedup state:** `sent.json` is local to the running instance and is gitignored.
-> On Vercel's ephemeral filesystem it will not persist reliably across invocations, so it
-> is suitable for local runs and early testing. The intended long-term migration is to
-> track sends in the database via an `abandonment_email_sent_at` column on `profiles`,
-> replacing the `sent-tracker.js` file logic with a Supabase read/write.
+> **Note on dedup state:** dedup is **Vercel KV**, not a file — the old `sent.json` scheme
+> did not survive Vercel's ephemeral filesystem. Bind `KV_REST_API_URL` /
+> `KV_REST_API_TOKEN` before any live send; without them the worker fails closed on Vercel
+> rather than re-mailing the same leads hourly (see the fail-closed dedup guard above).
 
 ---
 
@@ -287,16 +339,21 @@ environment variables and redeploy.
 
 ```
 standout-email-workers/
-├── abandonment-job-email/
+├── abandonment-anon-lead-email/          the one live worker
 │   ├── index.js          entry point / orchestrator + Vercel handler export
-│   ├── queries.js        all Supabase reads
+│   ├── queries.js        all Supabase reads (audience, exclusions, matching)
 │   ├── brevo.js          Brevo send logic
-│   ├── sent-tracker.js   local file-based dedup (no DB writes)
+│   ├── sent-tracker.js   Vercel KV send-once dedup (no DB writes)
+│   ├── lead-token.js     signed 14-day lead token minting
 │   ├── match-reason.js   AI-generated match pitch with fallback
+│   ├── *.test.js         node --test suites
 │   ├── .env.example
 │   └── package.json
+├── abandonment-job-email/                retired 2026-08-13 — no endpoint, no cron
+├── abandonment-job-email-2/              retired 2026-08-13 — no endpoint, no cron
+├── abandonment-job-email-resume-trigger/ retired 2026-08-13 — no endpoint, no cron
 ├── api/
-│   └── abandonment-job-email.js   Vercel serverless route → worker
-├── vercel.json           cron schedule
+│   └── abandonment-anon-lead-email.js   Vercel serverless route → worker
+├── vercel.json           cron schedule + function maxDuration
 └── README.md
 ```
