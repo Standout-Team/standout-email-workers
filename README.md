@@ -123,8 +123,43 @@ error stays final. The stage closes with a single aggregate line instead of one 
 lead:
 
 ```
-[queries] Match stage: matched 48, no-fresh-match 1, timed-out 1 (retried), deferred-by-budget 0 — 50 lead(s) in, 3 timeout retries, 0 other failure(s), concurrency=4, budget=240000ms, elapsed=71204ms.
+[queries] Match stage: matched 48, no-fresh-match 1, timed-out 1 (retried), deferred-by-budget 0 — 50 lead(s) in, 3 timeout retries, 0 other failure(s), concurrency=4, budget=240000ms, roleFanout=on, elapsed=71204ms.
 ```
+
+#### Matcher mode — `MATCH_ROLE_FANOUT` (must match the main app)
+
+`match_jobs_for_survey` takes a `p_balance` argument that selects **how** it
+ranks: off is one ANN from the survey's single vector; on retrieves candidates
+once *per role category* and interleaves them, so a survey naming 2+ categories
+doesn't collapse into whichever field its vector landed nearest. This worker
+passes `MATCH_ROLE_FANOUT` as that argument.
+
+| Variable | Effect |
+| --- | --- |
+| `MATCH_ROLE_FANOUT` | `on` (trimmed, case-insensitive) enables multi-vector ranking. **Unset = off = single-vector**, and so is every other value — `true`, `1` and `yes` are all off, because the main app's flag reads exactly this way. |
+
+> ⚠️ **Keep this equal to the main app's `MATCH_ROLE_FANOUT`.** The app ranks the
+> in-app feed with its own value; this worker picks the emailed featured job with
+> this one. When they diverge, the job in the email and the top job of the feed
+> that email's CTA lands on are chosen by *different matchers* and can be
+> different postings — measured on 2026-08-13, **5 of 6** recent surveys with 2+
+> role categories got a different top job out of the two modes. Surveys with 0 or
+> 1 categories are identical either way.
+
+The app's value is set on the **main app's** Vercel project; this one is set
+here. They are two separate projects, so nothing enforces the match — change both
+in the same sitting and redeploy both. Every run states which mode it used, in
+the start line (`roleFanout=on|off`), in the match-stage aggregate line, and as
+`balanced` in the JSON run summary, so a divergence is diagnosable from logs
+alone.
+
+Cost, measured on prod at concurrency 4: **76 ms** single-vector vs **503 ms**
+balanced on an 8-category survey — comfortably inside the 8 s `service_role`
+statement timeout, but it is the reason the fan-out stays bounded.
+
+Source of truth for the parser is `server/lib/feature-flags.ts` in the main
+`Standout-pro` repo; `balancedRoleMatchEnabled` in `queries.js` is a deliberate
+byte-identical twin and the two must be changed together.
 
 #### Targeted send (QA/support)
 
