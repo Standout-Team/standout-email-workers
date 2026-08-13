@@ -31,9 +31,11 @@ account to magic-link them into, so every CTA carries a signed 14-day lead token
 
 Audience: `surveys` with `marketing_opt_in`, `user_id IS NULL`, a parsed resume carrying a
 plausible email, created inside the run's window (below). Excludes existing `profiles`,
-`marketing_suppressions`, recent `paid|created` `pending_subscriptions`, and anyone with a
-`free_apply_grants` row. The featured job comes from the production
-`match_jobs_for_survey` RPC and is dropped if it closed or went stale (>3 days).
+`marketing_suppressions`, recent `paid` `pending_subscriptions`, and anyone with a
+`free_apply_grants` row. A `created`-but-unpaid checkout is **not** an exclusion — that
+lead abandoned too, and gets this email like any other abandoner. The featured job comes
+from the production `match_jobs_for_survey` RPC and is dropped if it closed or went stale
+(>3 days).
 
 Dedup is **Vercel KV** (`anon_lead_sent:<email_lc>`, stored indefinitely — one send per
 lead email, ever), matching `abandonment-job-email/`. Without `KV_REST_API_URL` /

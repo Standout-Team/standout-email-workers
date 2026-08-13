@@ -4,9 +4,11 @@ const ONE_HOUR_MS = 60 * 60 * 1000;
 const ONE_DAY_MS = 24 * ONE_HOUR_MS;
 const FRESH_DAY_STEPS = [3, 7, 14, 30];
 const SEVEN_DAYS_MS = 7 * 24 * 60 * 60 * 1000;
-// pending_subscriptions rows in these states mean the lead is already in the
-// pay-then-setup recovery flow — a different email owns them.
-const CHECKOUT_STATUSES = ['paid', 'created'];
+// Only a completed payment moves a lead into the pay-then-setup recovery flow
+// that owns them. A `created` (started-but-unpaid) Stripe checkout is still an
+// abandoner and gets this email exactly like every other abandoner — owner
+// decision 2026-08-12.
+const PAID_CHECKOUT_STATUSES = ['paid'];
 // Per-email ilike counts are one request each; keep the fan-out polite.
 const ILIKE_CHUNK = 10;
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
@@ -307,7 +309,7 @@ async function emailsPresentIn(table, emailsLc, refine) {
  * Emails we must not mail, unioned from four sources:
  *   a) profiles          — they already have an account (case-insensitive)
  *   b) marketing_suppressions — unsubscribed / bounced / complained
- *   c) pending_subscriptions  — recent paid|created checkout, by session or email
+ *   c) pending_subscriptions  — recent *paid* checkout, by session or email
  *   d) free_apply_grants      — already granted a free apply
  */
 async function findExclusions(candidates) {
@@ -329,13 +331,13 @@ async function findExclusions(candidates) {
   for (const row of suppressed || []) excluded.add(String(row.email).toLowerCase());
 
   const checkoutSince = new Date(Date.now() - SEVEN_DAYS_MS).toISOString();
-  const refineCheckout = (q) => q.in('status', CHECKOUT_STATUSES).gt('created_at', checkoutSince);
+  const refineCheckout = (q) => q.in('status', PAID_CHECKOUT_STATUSES).gt('created_at', checkoutSince);
 
   if (sessionIds.length > 0) {
     const { data: pending, error: pendingError } = await supabase
       .from('pending_subscriptions')
       .select('session_id')
-      .in('status', CHECKOUT_STATUSES)
+      .in('status', PAID_CHECKOUT_STATUSES)
       .gt('created_at', checkoutSince)
       .in('session_id', sessionIds);
     if (pendingError) throw new Error(`pending_subscriptions query failed: ${pendingError.message}`);
