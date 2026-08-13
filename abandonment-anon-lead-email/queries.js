@@ -198,6 +198,72 @@ function capForDedupAction(cap, action) {
   return Math.min(cap, NON_DURABLE_SEND_CAP);
 }
 
+/**
+ * TARGET_EMAILS — the QA/support targeted-send list. Pure; same contract as the
+ * other env helpers (takes an env object, returns a value, never logs).
+ *
+ * A comma-separated list, normalised to lowercase + trimmed, deduped, and
+ * validated against the same EMAIL_RE the audience uses. Returns
+ * `{ targets, invalid, active }`.
+ *
+ * Unset, empty, or whitespace-only is INACTIVE — the worker behaves exactly as
+ * it does today, with zero change.
+ *
+ * Anything else is ACTIVE, including a value whose every entry is junk. That is
+ * deliberate and fail-closed: an operator who fat-fingers `TARGET_EMAILS=qa@exampl`
+ * gets a run that can mail nobody (targets is empty, so the candidate filter
+ * keeps nothing) plus a loud warning — not a run that quietly mails the entire
+ * real cohort because the typo read as "unset".
+ */
+function parseTargetEmails(env = process.env) {
+  const raw = env.TARGET_EMAILS;
+  if (raw === undefined || raw === null || String(raw).trim() === '') {
+    return { targets: [], invalid: [], active: false };
+  }
+
+  const targets = [];
+  const invalid = [];
+  const seen = new Set();
+
+  for (const piece of String(raw).split(',')) {
+    const entry = piece.trim();
+    if (entry === '') continue; // a trailing or doubled comma is sloppiness, not a typo
+    const emailLc = entry.toLowerCase();
+    if (!EMAIL_RE.test(emailLc)) {
+      invalid.push(entry);
+      continue;
+    }
+    if (seen.has(emailLc)) continue;
+    seen.add(emailLc);
+    targets.push(emailLc);
+  }
+
+  return { targets, invalid, active: true };
+}
+
+/**
+ * Narrow a candidate cohort to the targeted-send list. Pure; never mutates the
+ * input and preserves the cohort's existing newest-first order.
+ *
+ * `missing` is the reason this returns three things instead of one: a target
+ * that never reaches the send loop is the whole diagnostic question of a
+ * targeted run, and the caller can only name it by diffing the ask against the
+ * cohort.
+ */
+function filterToTargets(candidates, targets) {
+  const wanted = new Set(targets);
+  const selected = [];
+  const dropped = [];
+
+  for (const lead of candidates) {
+    if (wanted.has(lead.email_lc)) selected.push(lead);
+    else dropped.push(lead);
+  }
+
+  const found = new Set(selected.map((l) => l.email_lc));
+  return { selected, dropped, missing: targets.filter((t) => !found.has(t)) };
+}
+
 // Newest abandoner first — freshest intent converts best, and it keeps paging
 // stable (survey id breaks created_at ties).
 function byCreatedAtDesc(a, b) {
@@ -421,10 +487,16 @@ async function fetchSurveyRows(win) {
  * exclusion set, the 3-day job-freshness gate, and the send-time token mint.
  * Returned newest-first. Pass `windowOverride` (from computeWindow) when the
  * caller has already resolved and logged the window.
+ *
+ * `targetingOverride` (from parseTargetEmails) is diagnostics only — it never
+ * changes which leads are returned. The targeted filter itself lives in run();
+ * what this function owns is the one drop the caller cannot see, because the
+ * exclusion set is discarded here.
  */
-async function findAnonLeads(windowOverride) {
+async function findAnonLeads(windowOverride, targetingOverride) {
   const win = windowOverride || computeWindow(Date.now(), process.env);
   if (!windowOverride && win.warning) console.warn(`[queries] ${win.warning}`);
+  const targeting = targetingOverride || parseTargetEmails(process.env);
 
   const rows = await fetchSurveyRows(win);
 
@@ -447,6 +519,23 @@ async function findAnonLeads(windowOverride) {
   const excluded = await findExclusions(candidates);
   const kept = candidates.filter((lead) => !excluded.has(lead.email_lc));
   console.log(`[queries] ${excluded.size} candidate(s) excluded → ${kept.length} lead(s) remain.`);
+
+  // The exclusion set is counted, never named, and then thrown away — so an
+  // excluded lead is indistinguishable downstream from one that was never in
+  // the window at all. That ambiguity is harmless for a real run and fatal for
+  // a targeted one, where "nothing sent" is the entire result and QA has to be
+  // able to explain it. Name the targets the exclusions ate.
+  if (targeting.active && excluded.size > 0) {
+    const excludedTargets = targeting.targets.filter((t) => excluded.has(t));
+    if (excludedTargets.length > 0) {
+      console.warn(
+        `[queries] TARGETED MODE: ${excludedTargets.length} target(s) dropped by the exclusion ` +
+          `set — ${excludedTargets.join(', ')}. That means they already have a profile, are in ` +
+          'marketing_suppressions, have a paid checkout in the last 7 days, or already hold a ' +
+          'free_apply_grants row. This is a rail, not a bug: it fires in targeted mode too.'
+      );
+    }
+  }
 
   return kept;
 }
@@ -547,6 +636,8 @@ module.exports = {
   selectForSend,
   evaluateDedupSafety,
   capForDedupAction,
+  parseTargetEmails,
+  filterToTargets,
   findAnonLeads,
   findFeaturedJobs,
   findExclusions,

@@ -98,6 +98,45 @@ remaining cohort instead of re-counting people who were already mailed. A backfi
 never drain with dedup quietly off: without the KV binding the worker refuses to send for
 real on Vercel (see the fail-closed guard above). If a run times out, lower `SEND_CAP`.
 
+#### Targeted send (QA/support)
+
+`TARGET_EMAILS` narrows a run to a named list — for testing the live template end to end,
+or resending to one lead who wrote in. It is a **filter, never a bypass**: exclusions, the
+KV sent-tracker, `SEND_CAP`, `DRY_RUN` and the fail-closed dedup guard all still apply, and
+the filter runs *before* the sent-tracker partition so every count in the log stays honest.
+
+| Variable | Effect |
+| --- | --- |
+| `TARGET_EMAILS` | Comma-separated addresses. Lowercased, trimmed, deduped, and validated. While set, **only** these people can be emailed and every real lead in the window is withheld. Unset / empty / whitespace = off, normal behaviour. |
+
+> ⚠️ **Leaving `TARGET_EMAILS` set silences the funnel.** Real leads are not queued or
+> deferred — they are skipped, and the hourly window moves on without them. Every run logs
+> `=== TARGETED MODE ACTIVE — … ; real leads are NOT being sent ===` as the alarm. Treat it
+> the way you'd treat a maintenance page left up.
+
+Procedure:
+
+1. Set `TARGET_EMAILS=someone@example.com` on the Vercel project. If the lead's survey is
+   older than ~1–2 hours it is outside the normal window, so **also** set `BACKFILL_DAYS`
+   wide enough to reach it (see the table above) — the two compose, and targeting works
+   identically in either window.
+2. Redeploy.
+3. Open `/api/abandonment-anon-lead-email` once to fire it immediately, or wait for the
+   top of the hour. The response body is the run summary, including `targeted`,
+   `targetCount` and `withheld`.
+4. **Remove both `TARGET_EMAILS` and `BACKFILL_DAYS`, and redeploy.** This is the step that
+   matters — until it lands, no real lead is being emailed.
+
+If nothing sends, the logs name the reason rather than making you guess:
+
+| Log line | Meaning |
+| --- | --- |
+| `TARGET NOT FOUND: <email>` | Not in the run's candidate set — their survey is outside the window (raise `BACKFILL_DAYS`) or they fail the audience criteria (opt-in, anonymous, parsed resume email). |
+| `TARGETED MODE: N target(s) dropped by the exclusion set` | They have a profile, are suppressed, have a paid checkout in the last 7 days, or already hold a free-apply grant. |
+| `TARGETED MODE: N target(s) were already mailed` | The sent-tracker is one-send-per-lead-email **forever**, and targeting does not reset it. |
+| `No open matches within 30d for <email>` | No fresh, open job match — nothing to feature. |
+| `TARGET_EMAILS parsed to ZERO valid addresses` | Every entry was junk. The run is fail-closed (it mails nobody), not open. |
+
 ---
 
 ## Setup
