@@ -196,9 +196,15 @@ Retired **2026-08-13**, after the workers' creator confirmed they are no longer 
 
 | Worker | Was scheduled | State at retirement |
 | --- | --- | --- |
-| `abandonment-job-email/` | hourly (`0 * * * *`) | Ran clean, found **0 eligible users** in sampled prod windows |
+| `abandonment-job-email/` | hourly (`0 * * * *`) | Ran clean, **actively sending** — the 21:00 UTC run on 2026-08-13 found 2 users and sent 2 real emails |
 | `abandonment-job-email-2/` | hourly (`0 * * * *`) | **Already broken** — 500 on every run with `TypeError: sentTracker.getSentJobId is not a function` at `abandonment-job-email-2/queries.js:63`, a casualty of the `sent.json` → Vercel KV migration (`sent-tracker.js` exports only `hasBeenSent` / `markSent`) |
-| `abandonment-job-email-resume-trigger/` | every 10 min (`*/10 * * * *`) | Ran clean, found **0 eligible users** in sampled prod windows |
+| `abandonment-job-email-resume-trigger/` | every 10 min (`*/10 * * * *`) | Ran clean, same live audience as `abandonment-job-email/` (deduped separately) |
+
+> **Spot checks showed "0 eligible users" — that was sampling, not an empty audience.**
+> The shared audience ran ~24 eligible people/day (167 over the 7 days to 2026-08-13),
+> and only about **half** of hourly windows contained anyone, so checking a few runs in a
+> row could easily show none. These were retired because they duplicate the anon-lead
+> worker's cohort and `-2` was dead — not because nobody was there.
 
 ### This is a coverage change, not a replacement
 
@@ -207,6 +213,12 @@ auto-login magic links. `abandonment-anon-lead-email/` deliberately targets the 
 audience — it **excludes** anyone present in `profiles` — so it does not pick these people
 up and never will. Retiring these three means that audience stops receiving these emails.
 That was the intent.
+
+Sized, over the 7 days to 2026-08-13: **167 people** were eligible (~24/day). **98** of
+them had also been anonymous opted-in leads before signing up, so the anon-lead worker had
+already emailed them — retiring these three only stops the *second* email for that group.
+The other **69** (~10/day) signed up without ever being an anonymous lead, so nothing
+emails them now. That is the real cost of this change.
 
 ### What was deleted, and why the entry point and not just the cron
 
