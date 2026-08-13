@@ -247,6 +247,29 @@ function resolveRunBudgetMs(env = process.env) {
 }
 
 /**
+ * Multi-vector role matching — the `p_balance` argument to
+ * match_jobs_for_survey. When a survey carries 2+ role categories the RPC
+ * retrieves candidates once PER category and interleaves them, instead of a
+ * single ANN from the survey vector that collapses into whichever field it
+ * landed nearest. Surveys with 0 or 1 categories are identical either way.
+ *
+ * SOURCE OF TRUTH: `Standout-pro/server/lib/feature-flags.ts`
+ * (`balancedRoleMatchEnabled`). This is a deliberate byte-for-byte twin of it —
+ * trim, lowercase, compare against the literal "on" — and the two MUST be kept
+ * in sync, in the code AND in the two Vercel projects' env. The app ranks the
+ * in-app feed with this setting and this worker picks the emailed featured job
+ * with it; if they disagree, a lead's email and their feed can name a different
+ * top job (measured 2026-08-13: 5 of 6 recent multi-category surveys).
+ *
+ * Pure, same contract as the resolvers above: takes an env object, returns a
+ * value, never logs. Unset is false — the single-vector path, which is what a
+ * worker with no MATCH_ROLE_FANOUT set has always done.
+ */
+function balancedRoleMatchEnabled(env = process.env) {
+  return String(env.MATCH_ROLE_FANOUT ?? '').trim().toLowerCase() === 'on';
+}
+
+/**
  * Map over `items` with at most `limit` calls to `fn` in flight at once.
  * Resolves to the results in INPUT ORDER — the pool is a scheduling detail, not
  * an ordering one.
@@ -718,6 +741,11 @@ async function findAnonLeads(windowOverride, targetingOverride) {
  * attempted at all. They are reported as `deferredByBudget`, not failed —
  * nothing marks them sent, so the next hourly run offers them again.
  *
+ * `options.balanced` is the matcher MODE (`p_balance`), and it must be the same
+ * one the app ranks the in-app feed with — see balancedRoleMatchEnabled. It is
+ * resolved ONCE here (or by the caller, once per run), never per lead: every
+ * lead in a run has to be ranked the same way for the run to mean anything.
+ *
  * `options` also carries three seams production never sets: `client`, `now` and
  * `sleep`, so the retry, the budget and the pool are testable without Supabase
  * and without real time passing.
@@ -729,6 +757,7 @@ async function findFeaturedJobs(leads, options = {}) {
     runStartMs = Date.now(),
     budgetMs = resolveRunBudgetMs(process.env).budgetMs,
     concurrency = resolveMatchConcurrency(process.env).concurrency,
+    balanced = balancedRoleMatchEnabled(process.env),
     client = null,
     now = Date.now,
     sleep = delay,
@@ -749,6 +778,10 @@ async function findFeaturedJobs(leads, options = {}) {
         p_survey_id: lead.survey_id,
         p_limit: 10,
         p_fresh_days: freshDays,
+        // Always sent explicitly, in both states. Omitting it would let the
+        // RPC's own `DEFAULT false` decide the mode, which is exactly the
+        // silent single-vector fallback this argument exists to close.
+        p_balance: balanced,
       });
 
       if (!error) return { matches: data, error: null, timedOut: false };
@@ -871,7 +904,7 @@ async function findFeaturedJobs(leads, options = {}) {
       `timed-out ${stats.timedOut} (retried), deferred-by-budget ${stats.deferredByBudget} — ` +
       `${leads.length} lead(s) in, ${stats.retried} timeout retr${stats.retried === 1 ? 'y' : 'ies'}, ` +
       `${stats.failed} other failure(s), concurrency=${concurrency}, budget=${budgetMs}ms, ` +
-      `elapsed=${now() - runStartMs}ms.`
+      `roleFanout=${balanced ? 'on' : 'off'}, elapsed=${now() - runStartMs}ms.`
   );
 
   return { matched, ...stats };
@@ -883,6 +916,7 @@ module.exports = {
   resolveSendCap,
   resolveMatchConcurrency,
   resolveRunBudgetMs,
+  balancedRoleMatchEnabled,
   mapWithConcurrency,
   selectForSend,
   evaluateDedupSafety,

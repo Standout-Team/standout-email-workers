@@ -5,6 +5,7 @@ const {
   resolveSendCap,
   resolveMatchConcurrency,
   resolveRunBudgetMs,
+  balancedRoleMatchEnabled,
   selectForSend,
   evaluateDedupSafety,
   capForDedupAction,
@@ -195,6 +196,12 @@ async function run() {
   if (concurrencyWarning) console.warn(`[abandonment-anon-lead-email] ${concurrencyWarning}`);
   const { budgetMs, warning: budgetWarning } = resolveRunBudgetMs(process.env);
   if (budgetWarning) console.warn(`[abandonment-anon-lead-email] ${budgetWarning}`);
+  // The matcher MODE, resolved once for the whole run — every lead in a run is
+  // ranked the same way. It must match the main app's MATCH_ROLE_FANOUT, or the
+  // job this email features and the top job of the feed the lead lands in are
+  // chosen by different matchers. Logged below and returned in the summary so a
+  // divergence is diagnosable from the logs alone.
+  const balanced = balancedRoleMatchEnabled(process.env);
 
   // TARGET_EMAILS — QA/support targeted send. Parsed and announced before the
   // dedup guard so the banner lands on every run while it is set, including the
@@ -282,6 +289,7 @@ async function run() {
     deferredByBudget: 0,
     sent: 0,
     skipped: 0,
+    balanced,
     dryRun,
   };
 
@@ -291,7 +299,8 @@ async function run() {
       `, window=${win.startIso} → ${win.endIso}, cap=${capLabel}, dedup=${dedupLabel}, ` +
       `targeted=${targeting.active}` +
       (targeting.active ? ` (${targeting.targets.length} target(s))` : '') +
-      `, matchConcurrency=${concurrency}, budget=${budgetMs}ms, DRY_RUN=${dryRun}`
+      `, matchConcurrency=${concurrency}, budget=${budgetMs}ms, ` +
+      `roleFanout=${balanced ? 'on' : 'off'}, DRY_RUN=${dryRun}`
   );
 
   let eligible;
@@ -378,7 +387,7 @@ async function run() {
 
   let featured;
   try {
-    featured = await findFeaturedJobs(selected, { runStartMs, budgetMs, concurrency });
+    featured = await findFeaturedJobs(selected, { runStartMs, budgetMs, concurrency, balanced });
   } catch (err) {
     console.error('[abandonment-anon-lead-email] Featured-job lookup failed, aborting:', err.message);
     throw err;
