@@ -230,7 +230,15 @@ queries.findAnonLeads = async (_win, targeting) => {
   stubs.targetingSeen = targeting;
   return stubs.cohort;
 };
-queries.findFeaturedJobs = async (leads) => leads.map((l) => ({ lead: l, job: JOB, pct: 88 }));
+// findFeaturedJobs returns { matched, ...counters } — see match-fanout.test.js.
+queries.findFeaturedJobs = async (leads) => ({
+  matched: leads.map((l) => ({ lead: l, job: JOB, pct: 88 })),
+  noFreshMatch: 0,
+  timedOut: 0,
+  retried: 0,
+  failed: 0,
+  deferredByBudget: 0,
+});
 brevo.sendJobEmail = async (payload) => {
   stubs.sentTo.push(payload.to[0].email);
   return 'stub-message-id';

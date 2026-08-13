@@ -126,7 +126,7 @@ queries.findAnonLeads = async () => {
 };
 queries.findFeaturedJobs = async () => {
   calls.findFeaturedJobs++;
-  return [];
+  return { matched: [], noFreshMatch: 0, timedOut: 0, retried: 0, failed: 0, deferredByBudget: 0 };
 };
 brevo.sendJobEmail = async () => {
   calls.send++;

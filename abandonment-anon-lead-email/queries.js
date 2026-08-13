@@ -31,6 +31,31 @@ const DEFAULT_BACKFILL_SEND_CAP = 50;
 const NON_DURABLE_SEND_CAP = 50;
 // Strict: digits with an optional sign. "14.5", "14d" and "" are all invalid.
 const INTEGER_RE = /^[+-]?\d+$/;
+
+// --- Match fan-out bounds ---------------------------------------------------
+// One match_jobs_for_survey call is an HNSW vector search, and a single lead can
+// walk the whole FRESH_DAY_STEPS ladder — up to 4 of them, sequentially. Fanning
+// the entire cohort out at once therefore put ~SEND_CAP concurrent vector
+// searches on the database: the 18:00 UTC run on 2026-08-13 lost 44 of 50 leads
+// to `canceling statement due to statement timeout` and sent 6 emails. The same
+// Postgres serves the live app's /api/match, so bounding this is a production
+// load rail, not only a throughput fix.
+const MATCH_CONCURRENCY = 4;
+const MIN_MATCH_CONCURRENCY = 1;
+const MAX_MATCH_CONCURRENCY = 10;
+// A bounded pool trades width for wall clock, and the platform kills the
+// invocation at maxDuration (300s, set in vercel.json). Stop handing leads to
+// the pool once the run has spent this much time and let the next hourly run
+// take the rest — nothing is marked sent, so the KV dedup re-offers them.
+const RUN_BUDGET_MS = 240000;
+const MIN_RUN_BUDGET_MS = 30000;
+const MAX_RUN_BUDGET_MS = 280000;
+// A statement timeout is what an overloaded pgvector search returns, and it is
+// transient. Retry that one step once, after a beat, then give up.
+const MATCH_RETRY_DELAY_MS = 750;
+// Postgres reports a cancelled statement as SQLSTATE 57014; PostgREST surfaces
+// the text. Match either, case-insensitively.
+const TIMEOUT_RE = /statement timeout|\b57014\b/i;
 // PostgREST caps a single response; a 30-day backfill can exceed it, so page.
 const SURVEY_PAGE_SIZE = 1000;
 const MAX_SURVEY_PAGES = 25;
@@ -134,6 +159,145 @@ function resolveSendCap(env = process.env, mode = 'normal') {
 
   return { cap: Number(text), warning: null };
 }
+
+/**
+ * How many match RPCs may be in flight at once. Pure, same warning contract as
+ * resolveSendCap: takes an env object, returns a value plus a string for the
+ * caller to log, never logs itself.
+ *
+ * Anything that isn't a positive integer falls back to the default; a value
+ * above the ceiling is clamped rather than rejected (the same split
+ * computeWindow makes for BACKFILL_DAYS). The ceiling exists because this fans
+ * out onto the *production* database — the knob is there to turn the pressure
+ * down during an incident, not up.
+ */
+function resolveMatchConcurrency(env = process.env) {
+  const raw = env.MATCH_CONCURRENCY;
+  if (raw === undefined || raw === null || String(raw).trim() === '') {
+    return { concurrency: MATCH_CONCURRENCY, warning: null };
+  }
+
+  const text = String(raw).trim();
+  if (!INTEGER_RE.test(text) || Number(text) < MIN_MATCH_CONCURRENCY) {
+    return {
+      concurrency: MATCH_CONCURRENCY,
+      warning:
+        `MATCH_CONCURRENCY="${text}" is not a positive integer — using the default of ` +
+        `${MATCH_CONCURRENCY}.`,
+    };
+  }
+
+  const requested = Number(text);
+  if (requested > MAX_MATCH_CONCURRENCY) {
+    return {
+      concurrency: MAX_MATCH_CONCURRENCY,
+      warning:
+        `MATCH_CONCURRENCY=${requested} exceeds the maximum of ${MAX_MATCH_CONCURRENCY} — ` +
+        `clamped to ${MAX_MATCH_CONCURRENCY}.`,
+    };
+  }
+
+  return { concurrency: requested, warning: null };
+}
+
+/**
+ * How long the match stage may keep scheduling leads, measured from the start of
+ * run(). Pure, same warning contract as resolveSendCap.
+ *
+ * Not a positive integer → the default. In range → itself. Outside the sane
+ * range → clamped to the nearer bound, with a warning: a budget under 30s can't
+ * finish a useful slice of the cohort, and one over 280s races the platform's
+ * own 300s kill, which is the failure this budget exists to prevent.
+ */
+function resolveRunBudgetMs(env = process.env) {
+  const raw = env.RUN_BUDGET_MS;
+  if (raw === undefined || raw === null || String(raw).trim() === '') {
+    return { budgetMs: RUN_BUDGET_MS, warning: null };
+  }
+
+  const text = String(raw).trim();
+  if (!INTEGER_RE.test(text) || Number(text) < 1) {
+    return {
+      budgetMs: RUN_BUDGET_MS,
+      warning:
+        `RUN_BUDGET_MS="${text}" is not a positive integer — using the default of ` +
+        `${RUN_BUDGET_MS}ms.`,
+    };
+  }
+
+  const requested = Number(text);
+  if (requested < MIN_RUN_BUDGET_MS) {
+    return {
+      budgetMs: MIN_RUN_BUDGET_MS,
+      warning:
+        `RUN_BUDGET_MS=${requested} is below the minimum of ${MIN_RUN_BUDGET_MS}ms — ` +
+        `clamped to ${MIN_RUN_BUDGET_MS}.`,
+    };
+  }
+  if (requested > MAX_RUN_BUDGET_MS) {
+    return {
+      budgetMs: MAX_RUN_BUDGET_MS,
+      warning:
+        `RUN_BUDGET_MS=${requested} exceeds the maximum of ${MAX_RUN_BUDGET_MS}ms — ` +
+        `clamped to ${MAX_RUN_BUDGET_MS}.`,
+    };
+  }
+
+  return { budgetMs: requested, warning: null };
+}
+
+/**
+ * Map over `items` with at most `limit` calls to `fn` in flight at once.
+ * Resolves to the results in INPUT ORDER — the pool is a scheduling detail, not
+ * an ordering one.
+ *
+ * Pure in the sense the other helpers here are: no env, no network, no logging,
+ * and the input array is read, never mutated or reordered.
+ *
+ * A rejected `fn` lands as `null` in its slot and the pool keeps going — one
+ * lead's failure must not cancel the other 49, which mirrors what the per-lead
+ * path already does by returning null. A caller that needs the error must catch
+ * inside `fn` (findFeaturedJobs does, so it can log once and count it).
+ *
+ * Workers pull from a shared cursor rather than running fixed batches, so one
+ * slow item never idles the rest of the pool behind a barrier.
+ */
+async function mapWithConcurrency(items, limit, fn) {
+  const list = [...items];
+  const results = new Array(list.length).fill(null);
+  if (list.length === 0) return results;
+
+  const requested = Math.trunc(Number(limit));
+  const width = Math.min(Number.isFinite(requested) && requested > 0 ? requested : 1, list.length);
+
+  let cursor = 0;
+  const worker = async () => {
+    // Single-threaded read-then-increment: no two workers can claim one index.
+    while (cursor < list.length) {
+      const index = cursor++;
+      try {
+        results[index] = await fn(list[index], index);
+      } catch (_) {
+        results[index] = null;
+      }
+    }
+  };
+
+  await Promise.all(Array.from({ length: width }, () => worker()));
+  return results;
+}
+
+/**
+ * Did this error come from a cancelled statement? Pure. Accepts a Supabase
+ * error object (code / message / details) or a bare string.
+ */
+function isTimeoutError(error) {
+  if (!error) return false;
+  if (typeof error === 'string') return TIMEOUT_RE.test(error);
+  return TIMEOUT_RE.test(`${error.code || ''} ${error.message || ''} ${error.details || ''}`);
+}
+
+const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 /**
  * Is it safe to send with the dedup state we actually have? Pure — takes three
@@ -545,94 +709,181 @@ async function findAnonLeads(windowOverride, targetingOverride) {
  * uses (HNSW vector search + structured boosts). It progressively relaxes the
  * freshness window until it finds a non-closed match.
  *
- * Returns [{ lead, job, pct }] in input order.
+ * Bounded: at most `concurrency` leads are in flight at once (default
+ * MATCH_CONCURRENCY). This used to be a bare Promise.all over the whole cohort,
+ * which meant SEND_CAP concurrent vector searches against the production
+ * database — see the MATCH_CONCURRENCY comment for what that cost on 2026-08-13.
+ *
+ * Bounded in time as well: leads picked up after `runStartMs + budgetMs` are not
+ * attempted at all. They are reported as `deferredByBudget`, not failed —
+ * nothing marks them sent, so the next hourly run offers them again.
+ *
+ * `options` also carries three seams production never sets: `client`, `now` and
+ * `sleep`, so the retry, the budget and the pool are testable without Supabase
+ * and without real time passing.
+ *
+ * Returns { matched: [{ lead, job, pct }] in input order, ...counters }.
  */
-async function findFeaturedJobs(leads) {
-  const supabase = getSupabase();
+async function findFeaturedJobs(leads, options = {}) {
+  const {
+    runStartMs = Date.now(),
+    budgetMs = resolveRunBudgetMs(process.env).budgetMs,
+    concurrency = resolveMatchConcurrency(process.env).concurrency,
+    client = null,
+    now = Date.now,
+    sleep = delay,
+  } = options;
 
-  const results = await Promise.all(
-    leads.map(async (lead) => {
-      for (const freshDays of FRESH_DAY_STEPS) {
-        const { data: matches, error: rpcError } = await supabase.rpc('match_jobs_for_survey', {
-          p_survey_id: lead.survey_id,
-          p_limit: 10,
-          p_fresh_days: freshDays,
-        });
+  const supabase = client || getSupabase();
+  const deadlineMs = runStartMs + budgetMs;
+  const stats = { noFreshMatch: 0, timedOut: 0, retried: 0, failed: 0, deferredByBudget: 0 };
 
-        if (rpcError) {
-          console.error(`[queries] match_jobs_for_survey failed for ${lead.email_lc}: ${rpcError.message}`);
-          return null;
+  /**
+   * One rung of the freshness ladder. A statement timeout under load is
+   * transient, so that single step is retried once after a beat — not the whole
+   * ladder, and not any other class of error, which stays as final as it was.
+   */
+  const runMatchStep = async (lead, freshDays) => {
+    for (let attempt = 0; ; attempt++) {
+      const { data, error } = await supabase.rpc('match_jobs_for_survey', {
+        p_survey_id: lead.survey_id,
+        p_limit: 10,
+        p_fresh_days: freshDays,
+      });
+
+      if (!error) return { matches: data, error: null, timedOut: false };
+
+      const timedOut = isTimeoutError(error);
+      if (timedOut && attempt === 0) {
+        // Deliberately silent: the whole point of this run's post-mortem was 44
+        // identical error lines. The aggregate line at the end carries the count.
+        stats.retried++;
+        await sleep(MATCH_RETRY_DELAY_MS);
+        continue;
+      }
+
+      return { matches: null, error, timedOut };
+    }
+  };
+
+  const featureOne = async (lead) => {
+    // Checked as each lead is picked up rather than only at batch boundaries: a
+    // worker pool has no batches, and per-lead is strictly tighter than one.
+    if (now() >= deadlineMs) {
+      stats.deferredByBudget++;
+      return null;
+    }
+
+    for (const freshDays of FRESH_DAY_STEPS) {
+      const { matches, error: rpcError, timedOut } = await runMatchStep(lead, freshDays);
+
+      if (rpcError) {
+        if (timedOut) stats.timedOut++;
+        else stats.failed++;
+        console.error(
+          `[queries] match_jobs_for_survey failed for ${lead.email_lc}: ${rpcError.message}` +
+            (timedOut ? ' (retried once after a statement timeout)' : '')
+        );
+        return null;
+      }
+      if (!matches || matches.length === 0) {
+        console.log(`[queries] No matches within ${freshDays}d for ${lead.email_lc}; trying next window.`);
+        continue;
+      }
+
+      // Hydrate the whole window's matches in ONE round trip rather than up
+      // to 10 sequential .single() calls. The ladder means the worst case per
+      // lead was 4 windows x 10 fetches = 40 round trips, and every lead's
+      // ladder used to run at once — the leads that reach the widest windows
+      // are exactly what a backfill run is made of. A row that is missing
+      // simply isn't in the map, which lands on the same `continue` the
+      // per-row error did.
+      const { data: jobRows, error: jobError } = await supabase
+        .from('jobs')
+        .select(
+          'id, title, company, location, salary_min, salary_max, work_type, source_url, description, role_category, first_seen_at, last_seen_at, ats_provider, closed_at'
+        )
+        .in(
+          'id',
+          matches.map((m) => m.job_id)
+        );
+
+      if (jobError) {
+        stats.failed++;
+        console.error(`[queries] job fetch failed for ${lead.email_lc}: ${jobError.message}`);
+        return null;
+      }
+      const jobsById = new Map((jobRows || []).map((j) => [j.id, j]));
+
+      // Iterate MATCHES, not jobsById — the RPC returns rows ordered by
+      // total_score DESC and `.in()` gives no ordering guarantee, so the map
+      // lookup is what preserves "best match first".
+      for (const match of matches) {
+        const job = jobsById.get(match.job_id);
+        if (!job) {
+          console.error(`[queries] job ${match.job_id} missing from the batch fetch — skipping.`);
+          continue;
         }
-        if (!matches || matches.length === 0) {
-          console.log(`[queries] No matches within ${freshDays}d for ${lead.email_lc}; trying next window.`);
+        if (job.closed_at) {
+          console.log(`[queries] Job ${job.id} is closed — trying next match for ${lead.email_lc}.`);
           continue;
         }
 
-        // Hydrate the whole window's matches in ONE round trip rather than up
-        // to 10 sequential .single() calls. The ladder means the worst case per
-        // lead was 4 windows x 10 fetches = 40 round trips, all inside the
-        // Promise.all that fans out across the entire cohort — and the leads
-        // that reach the widest windows are exactly what a backfill run is made
-        // of. A row that is missing simply isn't in the map, which lands on the
-        // same `continue` the per-row error did.
-        const { data: jobRows, error: jobError } = await supabase
-          .from('jobs')
-          .select(
-            'id, title, company, location, salary_min, salary_max, work_type, source_url, description, role_category, first_seen_at, last_seen_at, ats_provider, closed_at'
-          )
-          .in(
-            'id',
-            matches.map((m) => m.job_id)
-          );
-
-        if (jobError) {
-          console.error(`[queries] job fetch failed for ${lead.email_lc}: ${jobError.message}`);
-          return null;
-        }
-        const jobsById = new Map((jobRows || []).map((j) => [j.id, j]));
-
-        // Iterate MATCHES, not jobsById — the RPC returns rows ordered by
-        // total_score DESC and `.in()` gives no ordering guarantee, so the map
-        // lookup is what preserves "best match first".
-        for (const match of matches) {
-          const job = jobsById.get(match.job_id);
-          if (!job) {
-            console.error(`[queries] job ${match.job_id} missing from the batch fetch — skipping.`);
-            continue;
-          }
-          if (job.closed_at) {
-            console.log(`[queries] Job ${job.id} is closed — trying next match for ${lead.email_lc}.`);
-            continue;
-          }
-
-          // Mirrors visibleMatchPct in the main repo (server/marketing/match-digest.ts).
-          const pct = Math.max(70, Math.min(98, Math.round(70 + match.total_score * 28)));
-
-          console.log(
-            `[queries] ${lead.email_lc} → "${job.title}" at ${job.company} ` +
-              `(${pct}% match, score=${match.total_score.toFixed(3)}, freshness=${freshDays}d)`
-          );
-
-          return { lead, job, pct };
-        }
+        // Mirrors visibleMatchPct in the main repo (server/marketing/match-digest.ts).
+        const pct = Math.max(70, Math.min(98, Math.round(70 + match.total_score * 28)));
 
         console.log(
-          `[queries] No open matches within ${freshDays}d for ${lead.email_lc}; trying next window.`
+          `[queries] ${lead.email_lc} → "${job.title}" at ${job.company} ` +
+            `(${pct}% match, score=${match.total_score.toFixed(3)}, freshness=${freshDays}d)`
         );
+
+        return { lead, job, pct };
       }
 
-      console.log(`[queries] No open matches within 30d for ${lead.email_lc} — skipping.`);
+      console.log(
+        `[queries] No open matches within ${freshDays}d for ${lead.email_lc}; trying next window.`
+      );
+    }
+
+    stats.noFreshMatch++;
+    console.log(`[queries] No open matches within 30d for ${lead.email_lc} — skipping.`);
+    return null;
+  };
+
+  // The pool already turns a rejection into a null so one lead can't cancel the
+  // other 49 — but it does that silently. Catch here as well so an unexpected
+  // throw is still named once, and counted, instead of vanishing.
+  const results = await mapWithConcurrency(leads, concurrency, async (lead) => {
+    try {
+      return await featureOne(lead);
+    } catch (err) {
+      stats.failed++;
+      console.error(`[queries] featured-job lookup threw for ${lead.email_lc}: ${err.message}`);
       return null;
-    })
+    }
+  });
+  const matched = results.filter(Boolean);
+
+  // One aggregate line per run. Every count above it is per-lead and at most one
+  // line per distinct failure; this is the line that says what the stage did.
+  console.log(
+    `[queries] Match stage: matched ${matched.length}, no-fresh-match ${stats.noFreshMatch}, ` +
+      `timed-out ${stats.timedOut} (retried), deferred-by-budget ${stats.deferredByBudget} — ` +
+      `${leads.length} lead(s) in, ${stats.retried} timeout retr${stats.retried === 1 ? 'y' : 'ies'}, ` +
+      `${stats.failed} other failure(s), concurrency=${concurrency}, budget=${budgetMs}ms, ` +
+      `elapsed=${now() - runStartMs}ms.`
   );
 
-  return results.filter(Boolean);
+  return { matched, ...stats };
 }
 
 module.exports = {
   getSupabase,
   computeWindow,
   resolveSendCap,
+  resolveMatchConcurrency,
+  resolveRunBudgetMs,
+  mapWithConcurrency,
   selectForSend,
   evaluateDedupSafety,
   capForDedupAction,
@@ -641,12 +892,15 @@ module.exports = {
   findAnonLeads,
   findFeaturedJobs,
   findExclusions,
+  MATCH_CONCURRENCY,
+  RUN_BUDGET_MS,
   _internals: {
     parseResume,
     leadFromSurvey,
     optInTime,
     escapeLike,
     byCreatedAtDesc,
+    isTimeoutError,
     MIN_BACKFILL_DAYS,
     MAX_BACKFILL_DAYS,
     DEFAULT_BACKFILL_SEND_CAP,
@@ -654,5 +908,11 @@ module.exports = {
     NORMAL_LOOKBACK_MS,
     SETTLE_MS,
     ONE_DAY_MS,
+    MIN_MATCH_CONCURRENCY,
+    MAX_MATCH_CONCURRENCY,
+    MIN_RUN_BUDGET_MS,
+    MAX_RUN_BUDGET_MS,
+    MATCH_RETRY_DELAY_MS,
+    FRESH_DAY_STEPS,
   },
 };

@@ -3,6 +3,8 @@ require('dotenv').config();
 const {
   computeWindow,
   resolveSendCap,
+  resolveMatchConcurrency,
+  resolveRunBudgetMs,
   selectForSend,
   evaluateDedupSafety,
   capForDedupAction,
@@ -178,12 +180,21 @@ async function partitionBySentTracker(leads) {
 }
 
 async function run() {
+  // The budget clock starts HERE, not at the match stage: what the platform
+  // kills at maxDuration is the whole invocation, so every read before the
+  // match fan-out — surveys, exclusions, the KV partition — is time the match
+  // stage no longer has.
+  const runStartMs = Date.now();
   const dryRun = isDryRun();
 
-  const win = computeWindow(Date.now(), process.env);
+  const win = computeWindow(runStartMs, process.env);
   if (win.warning) console.warn(`[abandonment-anon-lead-email] ${win.warning}`);
   const { cap: requestedCap, warning: capWarning } = resolveSendCap(process.env, win.mode);
   if (capWarning) console.warn(`[abandonment-anon-lead-email] ${capWarning}`);
+  const { concurrency, warning: concurrencyWarning } = resolveMatchConcurrency(process.env);
+  if (concurrencyWarning) console.warn(`[abandonment-anon-lead-email] ${concurrencyWarning}`);
+  const { budgetMs, warning: budgetWarning } = resolveRunBudgetMs(process.env);
+  if (budgetWarning) console.warn(`[abandonment-anon-lead-email] ${budgetWarning}`);
 
   // TARGET_EMAILS — QA/support targeted send. Parsed and announced before the
   // dedup guard so the banner lands on every run while it is set, including the
@@ -268,6 +279,7 @@ async function run() {
     remaining: 0,
     selected: 0,
     deferred: 0,
+    deferredByBudget: 0,
     sent: 0,
     skipped: 0,
     dryRun,
@@ -279,7 +291,7 @@ async function run() {
       `, window=${win.startIso} → ${win.endIso}, cap=${capLabel}, dedup=${dedupLabel}, ` +
       `targeted=${targeting.active}` +
       (targeting.active ? ` (${targeting.targets.length} target(s))` : '') +
-      `, DRY_RUN=${dryRun}`
+      `, matchConcurrency=${concurrency}, budget=${budgetMs}ms, DRY_RUN=${dryRun}`
   );
 
   let eligible;
@@ -364,17 +376,34 @@ async function run() {
     return summary;
   }
 
-  let sendable;
+  let featured;
   try {
-    sendable = await findFeaturedJobs(selected);
+    featured = await findFeaturedJobs(selected, { runStartMs, budgetMs, concurrency });
   } catch (err) {
     console.error('[abandonment-anon-lead-email] Featured-job lookup failed, aborting:', err.message);
     throw err;
   }
 
+  const sendable = featured.matched;
+  const deferredByBudget = featured.deferredByBudget;
+  summary.deferredByBudget = deferredByBudget;
+
+  // A budget cut is not a failure and not a skip: those leads were never
+  // attempted, nothing marked them sent, and the KV dedup hands them straight
+  // back to the next hourly run.
+  if (deferredByBudget > 0) {
+    console.warn(
+      `[abandonment-anon-lead-email] RUN BUDGET reached after ${Date.now() - runStartMs}ms of ` +
+        `${budgetMs}ms — ${selected.length - deferredByBudget} lead(s) processed, ` +
+        `${deferredByBudget} deferred to the next run (not sent, not marked; the sent-tracker ` +
+        're-offers them next hour). Lower SEND_CAP if this repeats.'
+    );
+  }
+
   let sentCount = 0;
-  // leads with a failed tracker lookup + leads with no fresh match
-  let skipped = trackerErrors + (selected.length - sendable.length);
+  // leads with a failed tracker lookup + leads with no fresh match (leads the
+  // budget deferred are neither — they are still pending)
+  let skipped = trackerErrors + (selected.length - sendable.length - deferredByBudget);
 
   for (const { lead, job, pct } of sendable) {
     try {
@@ -427,11 +456,15 @@ async function run() {
 
   Object.assign(summary, { sent: sentCount, skipped });
 
+  // Budget-deferred leads are pending, so they belong with the cap-deferred in
+  // "left for later runs" rather than in `skipped`.
+  const budgetNote = deferredByBudget > 0 ? ` (+${deferredByBudget} deferred by the run budget)` : '';
+
   if (dryRun) {
     console.log(
       `[DRY RUN COMPLETE] Would send ${sentCount} of ${unsent.length} eligible — ` +
         `cap=${capLabel}; ${eligible.length} in window after exclusions, ${alreadySent} already sent, ` +
-        `${deferred} left for later runs, ${skipped} skipped.`
+        `${deferred} left for later runs${budgetNote}, ${skipped} skipped.`
     );
   } else {
     // `remaining` is the number the operator watches to decide when to unset
@@ -439,7 +472,8 @@ async function run() {
     // fresh job match — those leads are unmailable, not pending.
     console.log(
       `[abandonment-anon-lead-email] Run complete — mode=${win.mode}, sent ${sentCount}, ` +
-        `skipped ${skipped}, ${Math.max(0, unsent.length - sentCount)} remaining after this run.`
+        `skipped ${skipped}, ${Math.max(0, unsent.length - sentCount)} remaining after this ` +
+        `run${budgetNote}.`
     );
   }
 

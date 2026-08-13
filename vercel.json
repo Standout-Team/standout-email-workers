@@ -1,4 +1,9 @@
 {
+  "functions": {
+    "api/abandonment-anon-lead-email.js": {
+      "maxDuration": 300
+    }
+  },
   "crons": [
     {
       "path": "/api/abandonment-job-email",
