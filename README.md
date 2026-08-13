@@ -98,6 +98,34 @@ remaining cohort instead of re-counting people who were already mailed. A backfi
 never drain with dedup quietly off: without the KV binding the worker refuses to send for
 real on Vercel (see the fail-closed guard above). If a run times out, lower `SEND_CAP`.
 
+#### Match fan-out and the run budget
+
+The featured-job lookup is the expensive half of a run: `match_jobs_for_survey` is an HNSW
+vector search, one lead can walk up to four of them (the 3 → 7 → 14 → 30 day freshness
+ladder), and it runs against the **same** database that serves the live app's `/api/match`.
+It used to fan the whole cohort out at once, which meant `SEND_CAP` concurrent vector
+searches — the 18:00 UTC run on 2026-08-13 lost **44 of 50** leads to `canceling statement
+due to statement timeout` and sent 6 emails. It is now a bounded worker pool with a
+per-run time budget.
+
+| Variable | Effect |
+| --- | --- |
+| `MATCH_CONCURRENCY` | Match RPCs in flight at once. Default **4**, clamped **1–10**, invalid falls back to the default with a warning. It is a pressure valve for a database incident — turn it *down*. |
+| `RUN_BUDGET_MS` | How long the run may keep handing leads to the match stage, measured from the start of `run()`. Default **240000** (4 min), clamped **30000–280000**, invalid falls back to the default with a warning. Must stay under the function's `maxDuration` (300s, set in `vercel.json`). |
+
+Leads the budget did not reach are **deferred, not skipped**: nothing marked them sent, so
+the KV sent-tracker hands them back to the next hourly run. They show up as
+`deferredByBudget` in the run summary and as one `RUN BUDGET reached …` warning.
+
+A statement timeout is transient under load, so a timed-out match is retried **once** after
+750ms — that one ladder step, not the whole ladder, and only for timeouts. Every other
+error stays final. The stage closes with a single aggregate line instead of one error per
+lead:
+
+```
+[queries] Match stage: matched 48, no-fresh-match 1, timed-out 1 (retried), deferred-by-budget 0 — 50 lead(s) in, 3 timeout retries, 0 other failure(s), concurrency=4, budget=240000ms, elapsed=71204ms.
+```
+
 #### Targeted send (QA/support)
 
 `TARGET_EMAILS` narrows a run to a named list — for testing the live template end to end,
