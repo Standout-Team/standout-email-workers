@@ -1,20 +1,12 @@
 {
   "crons": [
     {
-      "path": "/api/abandonment-job-email",
-      "schedule": "0 * * * *"
-    },
-    {
-      "path": "/api/abandonment-job-email-2",
+      "path": "/api/abandonment-anon-lead-email",
       "schedule": "0 * * * *"
     },
     {
       "path": "/api/abandonment-job-email-resume-trigger",
       "schedule": "*/10 * * * *"
-    },
-    {
-      "path": "/api/abandonment-anon-lead-email",
-      "schedule": "0 * * * *"
     }
   ]
 }
