@@ -2,11 +2,18 @@
   "functions": {
     "api/abandonment-anon-lead-email.js": {
       "maxDuration": 300
+    },
+    "api/post-apply-followup-email.js": {
+      "maxDuration": 300
     }
   },
   "crons": [
     {
       "path": "/api/abandonment-anon-lead-email",
+      "schedule": "0 * * * *"
+    },
+    {
+      "path": "/api/post-apply-followup-email",
       "schedule": "0 * * * *"
     }
   ]

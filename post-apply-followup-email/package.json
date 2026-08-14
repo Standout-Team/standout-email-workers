@@ -1,0 +1,16 @@
+{
+  "name": "post-apply-followup-email",
+  "version": "1.0.0",
+  "description": "Hourly cron: sends follow-up email to free-apply users who haven't purchased after 24h",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js",
+    "dry-run": "DRY_RUN=true node index.js"
+  },
+  "dependencies": {
+    "@getbrevo/brevo": "*",
+    "@supabase/supabase-js": "*",
+    "@vercel/kv": "*",
+    "dotenv": "*"
+  }
+}
