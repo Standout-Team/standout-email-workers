@@ -20,6 +20,7 @@ const { sendJobEmail } = require('./brevo');
 const { signLeadToken, decodeLeadToken } = require('./lead-token');
 const sentTracker = require('./sent-tracker');
 const { resolveStage, resolveTemplateId, STAGE_ORDER, capForStage } = require('./stages');
+const { fetchTailoredBullets, tailoringConfigured } = require('./tailoring');
 
 // ---------------------------------------------------------------------------
 // Anonymous-lead re-engagement.
@@ -107,7 +108,7 @@ function buildLinks(lead, job) {
   return { token, jobUrl, matchesUrl };
 }
 
-function buildPayload(lead, job, pct, reasons, links, stage) {
+function buildPayload(lead, job, pct, reasons, links, stage, bullets) {
   const firstName = firstNameFor(lead.name);
 
   const params = {
@@ -126,6 +127,16 @@ function buildPayload(lead, job, pct, reasons, links, stage) {
   };
   const salary = formatSalary(job.salary_min, job.salary_max);
   if (salary) params.SALARY_RANGE = salary;
+
+  // Tailored bullets, for the stage whose email is built from them. Sent as
+  // both a list and numbered scalars: Brevo templates handle {{params.X}}
+  // reliably, while iterating a list is fiddlier. Absent keys simply render
+  // empty, so a two-bullet result leaves BULLET_3 blank rather than breaking.
+  if (Array.isArray(bullets) && bullets.length) {
+    params.TAILORED_BULLETS = bullets;
+    bullets.forEach((b, i) => { params[`BULLET_${i + 1}`] = b; });
+    params.BULLET_COUNT = bullets.length;
+  }
 
   return {
     // Per stage, not per worker: each email in the sequence has its own Brevo
@@ -286,6 +297,18 @@ async function run() {
       throw new Error(detail);
     }
     console.warn(`[abandonment-anon-lead-email] ${detail} Dry run continues.`);
+  }
+
+  // Same shape as the template guard, and for the same reason: a stage whose
+  // email is BUILT from tailored bullets cannot send a single one without the
+  // endpoint that produces them, so discovering that per-lead would bury the
+  // cause under a cohort of identical deferrals.
+  if (stage.requiresTailoring && !tailoringConfigured(process.env)) {
+    const detail =
+      `Stage "${stage.id}" (${stage.label}) is built from tailored bullets and needs ` +
+      'TAILORING_ENDPOINT_URL and TAILORING_ENDPOINT_SECRET.';
+    if (!dryRun) throw new Error(detail);
+    console.warn(`[abandonment-anon-lead-email] ${detail} Dry run continues without bullets.`);
   }
 
   // Two ceilings, both of which can only tighten: the dedup guard's, and the
@@ -452,6 +475,7 @@ async function run() {
   }
 
   let sentCount = 0;
+  let tailoringDeferred = 0;
   // leads with a failed tracker lookup + leads with no fresh match (leads the
   // budget deferred are neither — they are still pending)
   let skipped = trackerErrors + (selected.length - sendable.length - deferredByBudget);
@@ -469,7 +493,20 @@ async function run() {
       }
 
       const reasons = await generateMatchReasons(lead.resume_parsed, job);
-      const payload = buildPayload(lead, job, pct, reasons, links, stage);
+
+      // Skip-and-retry, not degrade (owner decision 2026-08-21). Nothing is
+      // marked, so the next hourly run re-offers this lead — which only works
+      // because this stage's window spans three hours. See stages.js.
+      let bullets = null;
+      if (stage.requiresTailoring) {
+        bullets = await fetchTailoredBullets(lead, job, process.env);
+        if (!bullets && !dryRun) {
+          tailoringDeferred++;
+          continue;
+        }
+      }
+
+      const payload = buildPayload(lead, job, pct, reasons, links, stage, bullets);
 
       if (dryRun) {
         console.log(
@@ -534,12 +571,19 @@ async function run() {
   // Budget-deferred leads are pending, so they belong with the cap-deferred in
   // "left for later runs" rather than in `skipped`.
   const budgetNote = deferredByBudget > 0 ? ` (+${deferredByBudget} deferred by the run budget)` : '';
+  // Tailoring deferrals are pending too — unmarked, so the next run re-offers
+  // them. Surfaced in the summary rather than left to a grep: a stage quietly
+  // deferring its whole cohort every hour is exactly the kind of failure that
+  // otherwise looks like "no eligible leads".
+  const tailoringNote =
+    tailoringDeferred > 0 ? ` (+${tailoringDeferred} deferred, tailoring unavailable)` : '';
+  summary.tailoringDeferred = tailoringDeferred;
 
   if (dryRun) {
     console.log(
       `[DRY RUN COMPLETE] Would send ${sentCount} of ${unsent.length} eligible — ` +
         `cap=${capLabel}; ${eligible.length} in window after exclusions, ${alreadySent} already sent, ` +
-        `${deferred} left for later runs${budgetNote}, ${skipped} skipped.`
+        `${deferred} left for later runs${budgetNote}${tailoringNote}, ${skipped} skipped.`
     );
   } else {
     // `remaining` is the number the operator watches to decide when to unset
@@ -548,7 +592,7 @@ async function run() {
     console.log(
       `[abandonment-anon-lead-email] Run complete — mode=${win.mode}, sent ${sentCount}, ` +
         `skipped ${skipped}, ${Math.max(0, unsent.length - sentCount)} remaining after this ` +
-        `run${budgetNote}.`
+        `run${budgetNote}${tailoringNote}.`
     );
   }
 

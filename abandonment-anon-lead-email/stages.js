@@ -61,6 +61,7 @@ const EMAIL_STAGES = Object.freeze({
     delayMs: ONE_HOUR_MS,
     spanMs: LAUNCH_SPAN_MS,
     maxPerRun: null,
+    requiresTailoring: false,
     kvKey: 'anon_lead_sent',
     templateEnv: 'BREVO_TEMPLATE_ID_ANON_LEAD',
   }),
@@ -70,6 +71,7 @@ const EMAIL_STAGES = Object.freeze({
     delayMs: 24 * ONE_HOUR_MS,
     spanMs: RETRY_SPAN_MS,
     maxPerRun: null,
+    requiresTailoring: false,
     kvKey: 'anon_lead_24h_sent',
     templateEnv: 'BREVO_TEMPLATE_ID_ANON_LEAD_24H',
   }),
@@ -81,6 +83,10 @@ const EMAIL_STAGES = Object.freeze({
     // One tailoring call per recipient against a 280s budget. Start low and
     // raise it once deferredByBudget shows there is headroom.
     maxPerRun: 10,
+    // This email shows the lead their application already written, so it
+    // cannot be sent without bullets. A failure defers the lead rather than
+    // sending a thinner email — see tailoring.js.
+    requiresTailoring: true,
     kvKey: 'anon_lead_48h_sent',
     templateEnv: 'BREVO_TEMPLATE_ID_ANON_LEAD_48H',
   }),
