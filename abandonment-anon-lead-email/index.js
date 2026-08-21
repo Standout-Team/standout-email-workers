@@ -196,7 +196,7 @@ async function partitionBySentTracker(leads, stage) {
   return { unsent, alreadySent, alreadySentEmails, trackerErrors };
 }
 
-async function run() {
+async function run(options = {}) {
   // The budget clock starts HERE, not at the match stage: what the platform
   // kills at maxDuration is the whole invocation, so every read before the
   // match fan-out — surveys, exclusions, the KV partition — is time the match
@@ -207,7 +207,12 @@ async function run() {
   // Which email in the sequence this invocation is sending. One cron entry per
   // stage, each pinning EMAIL_STAGE; an unset value is the 1h email, so the
   // existing cron keeps behaving exactly as it did before the sequence existed.
-  const stage = resolveStage(process.env.EMAIL_STAGE);
+  // Explicit argument first, EMAIL_STAGE second. The argument is what makes
+  // three hourly crons possible: Vercel cron entries carry only a path and a
+  // schedule — there are NO per-cron environment variables — so three crons
+  // sharing one env var would all run the same stage. Each stage gets its own
+  // thin entrypoint under api/ that names its stage here instead.
+  const stage = resolveStage(options.stage ?? process.env.EMAIL_STAGE);
   const templateId = resolveTemplateId(stage, process.env);
   console.log(
     `[abandonment-anon-lead-email] Stage ${stage.id} (${stage.label}) — ` +
@@ -599,20 +604,38 @@ async function run() {
   return summary;
 }
 
-// Vercel serverless handler — mounted at /api/abandonment-anon-lead-email
-async function handler(req, res) {
-  try {
-    const result = await run();
-    res.status(200).json({ ok: true, ...result });
-  } catch (err) {
-    console.error('[abandonment-anon-lead-email] Handler error:', err.message);
-    res.status(500).json({ ok: false, error: err.message });
-  }
+/**
+ * Builds the Vercel serverless handler for one stage.
+ *
+ * Stage resolution, in order: the stage this handler was built for, then
+ * ?stage= on the request, then EMAIL_STAGE. The query param exists for manual
+ * invocation — Vercel only fires crons on production deployments, so a staging
+ * run is someone POSTing this endpoint by hand and it needs to be able to pick
+ * a stage without a redeploy. An unknown value throws rather than falling back
+ * to the 1h email, which would mail the wrong copy on the wrong schedule.
+ */
+function createHandler(stageId) {
+  return async function handler(req, res) {
+    const requested =
+      stageId ??
+      (req && req.query && typeof req.query.stage === 'string' ? req.query.stage : undefined);
+    try {
+      const result = await run({ stage: requested });
+      res.status(200).json({ ok: true, ...result });
+    } catch (err) {
+      console.error('[abandonment-anon-lead-email] Handler error:', err.message);
+      res.status(500).json({ ok: false, error: err.message });
+    }
+  };
 }
+
+// Default export stays the 1h email so the existing cron path is unchanged.
+const handler = createHandler(null);
 
 module.exports = handler;
 module.exports.run = run;
 module.exports.handler = handler;
+module.exports.createHandler = createHandler;
 module.exports._internals = { formatSalary, formatJobAge, firstNameFor, buildLinks, buildPayload };
 
 // Run directly via `node index.js`

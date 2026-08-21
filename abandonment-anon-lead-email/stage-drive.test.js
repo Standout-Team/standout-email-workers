@@ -67,7 +67,7 @@ sentTracker.markSent = async (emailLc, jobId, stage) => {
 sentTracker.isDurable = () => true;
 matchReason.generateMatchReasons = async () => ['a', 'b', 'c'];
 
-const { run } = require('./index');
+const { run, createHandler } = require('./index');
 
 const GUARDED_ENV = [
   'EMAIL_STAGE',
@@ -211,4 +211,67 @@ test('run(): an unknown EMAIL_STAGE fails the run instead of guessing', async ()
     () => drive({ EMAIL_STAGE: 'day7', DRY_RUN: 'false' }, () => run()),
     /Unknown email stage "day7"/
   );
+});
+
+// --- Per-stage entrypoints -------------------------------------------------
+//
+// A Vercel cron entry carries only a path and a schedule. There are NO
+// per-cron environment variables, so three crons sharing one path would all
+// run whatever EMAIL_STAGE happened to be — silently mailing one stage's copy
+// three times a day instead of running the sequence.
+
+test('createHandler runs the stage it was built for, ignoring EMAIL_STAGE', async () => {
+  const { result } = await drive(
+    { EMAIL_STAGE: 'first', DRY_RUN: 'false', BREVO_TEMPLATE_ID_ANON_LEAD_24H: '41' },
+    async () => {
+      let captured;
+      const res = { status: () => res, json: (b) => { captured = b; return res; } };
+      await createHandler('day1')({ query: {} }, res);
+      return captured;
+    }
+  );
+  assert.equal(result.ok, true, result.error);
+  assert.equal(calls.marked[0].stageId, 'day1', 'the built-for stage must win over the env var');
+});
+
+test('a handler with no stage falls back to EMAIL_STAGE', async () => {
+  const { result } = await drive(
+    { EMAIL_STAGE: 'day1', DRY_RUN: 'false', BREVO_TEMPLATE_ID_ANON_LEAD_24H: '41' },
+    async () => {
+      let captured;
+      const res = { status: () => res, json: (b) => { captured = b; return res; } };
+      await createHandler(null)({ query: {} }, res);
+      return captured;
+    }
+  );
+  assert.equal(result.ok, true, result.error);
+  assert.equal(calls.marked[0].stageId, 'day1');
+});
+
+test('?stage= picks a stage for manual staging invocation', async () => {
+  // Vercel fires crons only on production deployments, so a staging run is a
+  // human POSTing the endpoint — it needs to choose a stage without a redeploy.
+  const { result } = await drive(
+    { DRY_RUN: 'false', BREVO_TEMPLATE_ID_ANON_LEAD_24H: '41' },
+    async () => {
+      let captured;
+      const res = { status: () => res, json: (b) => { captured = b; return res; } };
+      await createHandler(null)({ query: { stage: 'day1' } }, res);
+      return captured;
+    }
+  );
+  assert.equal(result.ok, true, result.error);
+  assert.equal(calls.marked[0].stageId, 'day1');
+});
+
+test('an unknown ?stage= fails the request rather than mailing the wrong copy', async () => {
+  const { result } = await drive({ DRY_RUN: 'false', BREVO_TEMPLATE_ID_ANON_LEAD: '39' }, async () => {
+    let captured;
+    const res = { status: () => res, json: (b) => { captured = b; return res; } };
+    await createHandler(null)({ query: { stage: 'day7' } }, res);
+    return captured;
+  });
+  assert.equal(result.ok, false);
+  assert.match(result.error, /Unknown email stage "day7"/);
+  assert.equal(calls.send, 0);
 });

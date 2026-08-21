@@ -275,7 +275,7 @@ These configure `abandonment-anon-lead-email/`, the only worker that still runs.
 | `BREVO_TEMPLATE_ID_ANON_LEAD_24H` | Brevo template for the **24h** email (stage `day1`) — id **43** |
 | `BREVO_TEMPLATE_ID_ANON_LEAD_48H` | Brevo template for the **48h** email (stage `day2`) — id **44** |
 | `TAILORING_ENDPOINT_URL` / `_SECRET` | The 48h email's tailored bullets. **Required** for a real `day2` run; a dry run warns and continues. |
-| `EMAIL_STAGE`                 | Which email this invocation sends: `first` (default), `day1`, `day2`. One cron entry per stage. An unknown value fails the run rather than guessing. |
+| `EMAIL_STAGE`                 | Fallback stage for the default entrypoint. **Normally unset** — each stage has its own `api/` file that names its stage directly (see below). Useful for a local run. An unknown value fails the run rather than guessing. |
 | `KV_ENV_PREFIX`               | Namespaces the KV keyspace. **Leave unset in production. Set it in staging** — see below. |
 | `ANTHROPIC_API_KEY`           | Anthropic key for match-pitch generation                      |
 | `STANDOUT_APP_URL`            | Base URL for the `/your-match` landing page                   |
@@ -331,6 +331,27 @@ Two rails you should know about before touching this:
   entire history on the next tick. `stages.test.js` asserts the exact string.
 - **A real run refuses to start without a template for its stage.** A dry run
   warns instead, which is how you rehearse a stage before its template exists.
+
+**One entrypoint per stage, and it has to be that way.** A Vercel cron entry
+carries only a `path` and a `schedule` — there are **no per-cron environment
+variables**. Three crons pointed at one path would therefore all run whatever
+`EMAIL_STAGE` happened to be, silently mailing one stage's copy three times a
+day instead of running the sequence. So each stage gets a thin file under
+`api/` that names its stage in code, where it cannot be misconfigured:
+
+| Cron path | Stage | Schedule |
+| --- | --- | --- |
+| `/api/abandonment-anon-lead-email` | `first` (1h) | `0 * * * *` |
+| `/api/abandonment-anon-lead-email-24h` | `day1` (24h) | `20 * * * *` |
+| `/api/abandonment-anon-lead-email-48h` | `day2` (48h) | `40 * * * *` |
+
+Staggered by 20 minutes so three runs never contend for the same match RPCs —
+the vector search is the shared resource, and the 2026-08-13 timeout incident
+is what a pile-up looks like.
+
+A manual invocation can also pass `?stage=day1`, which is how staging picks a
+stage without a redeploy. An unknown value fails the request rather than
+falling back to the 1h email.
 
 **Staging must set `KV_ENV_PREFIX`.** Vercel only fires crons on production
 deployments, so a staging run is a manual invocation — and without an
