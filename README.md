@@ -296,14 +296,14 @@ system. Every `{{ params.X }}` in them is a param `buildPayload` actually
 sends — a token the worker does not send renders empty, silently, which is how
 a half-rendered email ships.
 
-Two things in 43/44 deliberately DIVERGE from 39, and 39 should be brought in
-line separately:
+All three carry the same footer, corrected 2026-08-21:
 
-- **The privacy link.** 39 points at `standout.jobs/privacy`, which no longer
-  resolves — a dead link in a live email. 43/44 use
+- **The privacy link.** 39 pointed at `standout.jobs/privacy` for an unknown
+  length of time. The domain resolves but refuses connections, so every
+  abandonment lead who clicked "Privacy Policy" got an error page. Now
   `www.usestandout.today/privacy`.
-- **The consent line.** 39 says "you created a Standout account". These leads
-  have no account; they uploaded a resume. 43/44 say so.
+- **The consent line.** 39 said "you created a Standout account". These leads
+  have no account — they uploaded a resume. All three now say that.
 
 Both use `{{ unsubscribe }}`, Brevo's own token, rather than a param — an
 unsubscribe URL passed as a param is only as reliable as the sender
