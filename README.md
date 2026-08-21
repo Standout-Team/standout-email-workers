@@ -183,7 +183,9 @@ If nothing sends, the logs name the reason rather than making you guess:
 | Log line | Meaning |
 | --- | --- |
 | `TARGET NOT FOUND: <email>` | Not in the run's candidate set — their survey is outside the window (raise `BACKFILL_DAYS`) or they fail the audience criteria (opt-in, anonymous, parsed resume email). |
-| `TARGETED MODE: N target(s) dropped by the exclusion set` | They have a profile, are suppressed, have a paid checkout in the last 7 days, or already hold a free-apply grant. |
+| `TARGETED MODE: N target(s) dropped by the exclusion set` | They have a profile, are suppressed, or have a paid checkout in the last 7 days. Holding a free-apply grant is **no longer** an exclusion (2026-08-21). |
+| `TARGETED MODE: N target(s) dropped as international` | Their resume phone or location reads as outside the US. Canada counts as eligible. |
+| `<email> converted since the cohort was built` | The send-time paid re-check caught a lead who paid between the cohort query and dispatch. Working as intended. |
 | `TARGETED MODE: N target(s) were already mailed` | The sent-tracker is one-send-per-lead-email **forever**, and targeting does not reset it. |
 | `No open matches within 30d for <email>` | No fresh, open job match — nothing to feature. |
 | `TARGET_EMAILS parsed to ZERO valid addresses` | Every entry was junk. The run is fail-closed (it mails nobody), not open. |
@@ -269,12 +271,101 @@ These configure `abandonment-anon-lead-email/`, the only worker that still runs.
 | `SUPABASE_URL`                | Supabase project URL                                          |
 | `SUPABASE_SERVICE_KEY`        | Service role key (read access is all that's needed)           |
 | `BREVO_API_KEY`               | Brevo API key                                                 |
-| `BREVO_TEMPLATE_ID_ANON_LEAD` | Brevo transactional template for the anon-lead email          |
+| `BREVO_TEMPLATE_ID_ANON_LEAD` | Brevo template for the **1h** email (stage `first`) — live, id **39** |
+| `BREVO_TEMPLATE_ID_ANON_LEAD_24H` | Brevo template for the **24h** email (stage `day1`) — id **43** |
+| `BREVO_TEMPLATE_ID_ANON_LEAD_48H` | Brevo template for the **48h** email (stage `day2`) — id **44** |
+| `TAILORING_ENDPOINT_URL` / `_SECRET` | The 48h email's tailored bullets. **Required** for a real `day2` run; a dry run warns and continues. |
+| `EMAIL_STAGE`                 | Fallback stage for the default entrypoint. **Normally unset** — each stage has its own `api/` file that names its stage directly (see below). Useful for a local run. An unknown value fails the run rather than guessing. |
+| `KV_ENV_PREFIX`               | Namespaces the KV keyspace. **Leave unset in production. Set it in staging** — see below. |
 | `ANTHROPIC_API_KEY`           | Anthropic key for match-pitch generation                      |
 | `STANDOUT_APP_URL`            | Base URL for the `/your-match` landing page                   |
 | `EMAIL_LINK_SECRET`           | HMAC secret for the lead token — must match the main app's    |
 | `KV_REST_API_URL` / `_TOKEN`  | Vercel KV send-once dedup. **Required on Vercel** (fail-closed)|
 | `DRY_RUN`                     | `true` (default) logs only; `false` sends live emails. Scoped to this worker alone — the retired workers read their own copies of it and no longer run. |
+
+### Brevo templates
+
+| Stage | Template | Subject |
+| --- | --- | --- |
+| `first` | **39** (live, do not touch) | 🔥 `{{FIRST_NAME}}`, this one's for you — … |
+| `day1` | **43** | Hey `{{FIRST_NAME}}`, `{{COMPANY_NAME}}` is looking for someone like you |
+| `day2` | **44** | `{{FIRST_NAME}}`, your application to `{{COMPANY_NAME}}` is already written |
+
+43 and 44 are built from 39's own stylesheet so the sequence reads as one
+system. Every `{{ params.X }}` in them is a param `buildPayload` actually
+sends — a token the worker does not send renders empty, silently, which is how
+a half-rendered email ships.
+
+All three carry the same footer, corrected 2026-08-21:
+
+- **The privacy link.** 39 pointed at `standout.jobs/privacy` for an unknown
+  length of time. The domain resolves but refuses connections, so every
+  abandonment lead who clicked "Privacy Policy" got an error page. Now
+  `www.usestandout.today/privacy`.
+- **The consent line.** 39 said "you created a Standout account". These leads
+  have no account — they uploaded a resume. All three now say that.
+
+Both use `{{ unsubscribe }}`, Brevo's own token, rather than a param — an
+unsubscribe URL passed as a param is only as reliable as the sender
+remembering to pass it.
+
+**Template 40** ("Abandonment Email 2 (24hr Nurture)", inactive) predates this
+work and is NOT wired up. It expects `MATCH_COUNT`, `TIME_SINCE_SIGNUP` and
+`UNSUBSCRIBE_URL` — none of which this worker sends, so its unsubscribe link
+would render empty. Use 43.
+
+### The sequence, and running it in staging
+
+One worker, three emails, selected by `EMAIL_STAGE`. Each stage sends to leads
+whose survey settled `delayMs` ago — `first` at 1h, `day1` at 24h, `day2` at 48h
+— so each hourly run considers exactly one one-hour slice of surveys per stage
+and the cohorts never overlap. Stage definitions live in `stages.js`; adding an
+email means adding an entry there plus its Brevo template. The 72h discount
+email is deliberately absent: it is blocked on Stripe coupon infrastructure.
+
+Two rails you should know about before touching this:
+
+- **`stages.first.kvKey` is `anon_lead_sent`, not `anon_lead_1h_sent`.** The
+  implementation spec says otherwise and the spec is wrong. Renaming it makes
+  every lead ever mailed look unmailed, and the 1h email re-fires across the
+  entire history on the next tick. `stages.test.js` asserts the exact string.
+- **A real run refuses to start without a template for its stage.** A dry run
+  warns instead, which is how you rehearse a stage before its template exists.
+
+**One entrypoint per stage, and it has to be that way.** A Vercel cron entry
+carries only a `path` and a `schedule` — there are **no per-cron environment
+variables**. Three crons pointed at one path would therefore all run whatever
+`EMAIL_STAGE` happened to be, silently mailing one stage's copy three times a
+day instead of running the sequence. So each stage gets a thin file under
+`api/` that names its stage in code, where it cannot be misconfigured:
+
+| Cron path | Stage | Schedule |
+| --- | --- | --- |
+| `/api/abandonment-anon-lead-email` | `first` (1h) | `0 * * * *` |
+| `/api/abandonment-anon-lead-email-24h` | `day1` (24h) | `20 * * * *` |
+| `/api/abandonment-anon-lead-email-48h` | `day2` (48h) | `40 * * * *` |
+
+Staggered by 20 minutes so three runs never contend for the same match RPCs —
+the vector search is the shared resource, and the 2026-08-13 timeout incident
+is what a pile-up looks like.
+
+A manual invocation can also pass `?stage=day1`, which is how staging picks a
+stage without a redeploy. An unknown value fails the request rather than
+falling back to the 1h email.
+
+**Staging must set `KV_ENV_PREFIX`.** Vercel only fires crons on production
+deployments, so a staging run is a manual invocation — and without an
+environment prefix it writes into production's keyspace, marks real leads as
+sent, and silently suppresses the production email they were owed. Nothing
+downstream reports that; the lead simply never hears from us again. A staging
+run should set `KV_ENV_PREFIX`, `DRY_RUN=true` and a `TARGET_EMAILS` allowlist.
+The Supabase key is read-only, so pointing staging at production data is safe
+once those three are in place.
+
+```bash
+EMAIL_STAGE=day1 KV_ENV_PREFIX=staging DRY_RUN=true \
+  TARGET_EMAILS=qa@example.com node index.js
+```
 
 Tuning and operational vars (`BACKFILL_DAYS`, `SEND_CAP`, `MATCH_CONCURRENCY`,
 `RUN_BUDGET_MS`, `MATCH_ROLE_FANOUT`, `TARGET_EMAILS`) are documented in their own sections

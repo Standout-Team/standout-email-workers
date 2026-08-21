@@ -1,4 +1,5 @@
 const { createClient } = require('@supabase/supabase-js');
+const { DEFAULT_STAGE, resolveStage, STAGE_ORDER, capForStage } = require('./stages');
 
 const ONE_HOUR_MS = 60 * 60 * 1000;
 const ONE_DAY_MS = 24 * ONE_HOUR_MS;
@@ -20,6 +21,12 @@ const SETTLE_MS = ONE_HOUR_MS;
 // Normal mode looks back exactly one hour further, so the hourly cron considers
 // every survey exactly once.
 const NORMAL_LOOKBACK_MS = 2 * ONE_HOUR_MS;
+// The width of one normal-mode cohort for a stage that does not set its own.
+// Derived, not restated, so the launch stage's window stays "the hour that
+// ended delayMs ago" however SETTLE_MS and NORMAL_LOOKBACK_MS move. Stages
+// override it with spanMs — see the retry-budget note in stages.js.
+const NORMAL_SPAN_MS = NORMAL_LOOKBACK_MS - SETTLE_MS;
+const spanForStage = (stage) => stage.spanMs || NORMAL_SPAN_MS;
 const MIN_BACKFILL_DAYS = 1;
 const MAX_BACKFILL_DAYS = 30;
 // Backfill cohorts are large; bound the real sends per run so one invocation
@@ -60,6 +67,197 @@ const TIMEOUT_RE = /statement timeout|\b57014\b/i;
 const SURVEY_PAGE_SIZE = 1000;
 const MAX_SURVEY_PAGES = 25;
 
+// --- Geography filter (US-only sends) ------------------------------------
+// The featured job comes from US ATS boards, so a lead outside the US gets an
+// email whose CTA cannot help them. That mismatch — not the copy — is what
+// drives the unsubscribes, so the fix is to keep those leads out of the flow
+// rather than to re-rank the job. Owner decision 2026-08-20.
+//
+// Two signals, in strict order: the resume's phone country code, then its
+// location string. Both are advisory, and the whole filter FAILS OPEN — no
+// signal, or a signal we do not recognise, keeps the lead. A wrongly dropped
+// US lead costs a conversion; a wrongly kept international lead costs one
+// email, so the asymmetry is deliberate.
+//
+// CANADA IS DELIBERATELY ELIGIBLE (owner override 2026-08-20, reversing the
+// original spec's "most US ATS jobs require US work auth"). That is why
+// 'canada' appears in neither marker list and '+1' appears in no prefix set:
+// NANP covers the US and Canada alike. Canadian leads are kept by the
+// fail-open branch rather than by a positive US signal — if anyone ever
+// tightens fail-open, Canada breaks silently. Re-read this comment first.
+const NON_US_PHONE_PREFIXES = new Set([
+  '+7',   // Russia / Kazakhstan
+  '+20',  // Egypt
+  '+27',  // South Africa
+  '+30',  // Greece
+  '+31',  // Netherlands
+  '+32',  // Belgium
+  '+33',  // France
+  '+34',  // Spain
+  '+36',  // Hungary
+  '+39',  // Italy
+  '+40',  // Romania
+  '+41',  // Switzerland
+  '+43',  // Austria
+  '+44',  // UK
+  '+45',  // Denmark
+  '+46',  // Sweden
+  '+47',  // Norway
+  '+48',  // Poland
+  '+49',  // Germany
+  '+51',  // Peru
+  '+52',  // Mexico
+  '+54',  // Argentina
+  '+55',  // Brazil
+  '+56',  // Chile
+  '+57',  // Colombia
+  '+58',  // Venezuela
+  '+60',  // Malaysia
+  '+61',  // Australia
+  '+62',  // Indonesia
+  '+63',  // Philippines
+  '+64',  // New Zealand
+  '+65',  // Singapore
+  '+66',  // Thailand
+  '+81',  // Japan
+  '+82',  // South Korea
+  '+84',  // Vietnam
+  '+86',  // China
+  '+90',  // Turkey
+  '+91',  // India
+  '+92',  // Pakistan
+  '+94',  // Sri Lanka
+  '+98',  // Iran
+  '+212', // Morocco
+  '+213', // Algeria
+  '+216', // Tunisia
+  '+220', // Gambia
+  '+221', // Senegal
+  '+225', // Ivory Coast
+  '+233', // Ghana
+  '+234', // Nigeria
+  '+254', // Kenya
+  '+256', // Uganda
+  '+263', // Zimbabwe
+  '+351', // Portugal
+  '+353', // Ireland
+  '+358', // Finland
+  '+380', // Ukraine
+  '+420', // Czech Republic
+  '+421', // Slovakia
+  '+880', // Bangladesh
+  '+971', // UAE
+  '+972', // Israel
+  '+974', // Qatar
+  '+977', // Nepal
+]);
+
+// Longest-first so a prefix can never be shadowed by a shorter one that is its
+// own prefix. Defensive today — every entry returns the same verdict, so order
+// cannot change the answer — and load-bearing the day anyone adds a NANP
+// country code like '+1876'. Computed once at module load, never per call.
+const NON_US_PHONE_PREFIXES_DESC = [...NON_US_PHONE_PREFIXES].sort((a, b) => b.length - a.length);
+
+// Country names that mean "not US" ANYWHERE in the location string. Matched
+// WORD-BOUNDED, not by substring: bare .includes() reads 'india' inside
+// "Hobart, Indiana" and 'uk' inside "Sauk Rapids, MN" / "Kaukauna, Wisconsin",
+// each of which silently suppressed a real US lead (3 in the 2,693-survey
+// corpus measured 2026-08-20). 'canada' is deliberately absent — see above.
+const INTL_LOCATION_MARKERS = [
+  'india', 'brasil', 'germany', 'deutschland', 'france', 'spain', 'españa',
+  'italia', 'portugal', 'netherlands', 'belgium', 'belgique', 'polska',
+  'ukraine', 'russia', 'japan', 'korea', 'pakistan', 'bangladesh', 'nigeria',
+  'kenya', 'ghana', 'australia', 'new zealand', 'singapore', 'malaysia',
+  'indonesia', 'philippines', 'vietnam', 'thailand', 'colombia', 'argentina',
+  'venezuela', 'ecuador', 'bolivia', 'paraguay', 'uruguay', 'uk',
+  'united kingdom', 'ireland', 'sweden', 'finland', 'austria', 'czech',
+  'romania', 'hungary', 'slovakia', 'israel', 'uae', 'united arab emirates',
+  'saudi', 'qatar', 'kuwait', 'bahrain', 'iran', 'iraq', 'sri lanka', 'nepal',
+  // Indian states and union territories. India is the single largest cohort
+  // here, and a large share of those resumes give a city and a state but never
+  // write "India" — "Chennai, Tamil Nadu", "Pune, Maharashtra". Measured
+  // 2026-08-20: 44 such leads were still being mailed by the country-name
+  // check alone. None of these names collides with a US place name.
+  'andhra pradesh', 'arunachal', 'assam', 'bihar', 'chhattisgarh', 'goa',
+  'gujarat', 'haryana', 'himachal', 'jharkhand', 'karnataka', 'kerala',
+  'madhya pradesh', 'maharashtra', 'manipur', 'meghalaya', 'mizoram',
+  'nagaland', 'odisha', 'punjab', 'rajasthan', 'sikkim', 'tamil nadu',
+  'tamilnadu', 'telangana', 'tripura', 'uttar pradesh', 'uttarakhand',
+  'west bengal', 'puducherry', 'chandigarh', 'new delhi',
+];
+
+// Country names that are ALSO the names of real US towns and regions: Brazil
+// IN, Peru IN, Mexico MO, China Grove NC, Poland OH, Wales WI, Norway MI,
+// Denmark SC, Holland MI, New England, Switzerland FL. A word boundary is not
+// enough for these — "Brazil, IN" is word-bounded 'brazil' and is Indiana. So
+// they only count in the COUNTRY position: the final comma-segment, or the
+// whole string. "São Paulo, Brazil" drops; "Brazil, IN" falls through to the
+// state regex and is kept.
+const INTL_TAIL_ONLY_MARKERS = [
+  'mexico', 'china', 'brazil', 'italy', 'egypt', 'poland', 'turkey', 'chile',
+  'wales', 'scotland', 'norway', 'denmark', 'holland', 'england', 'peru',
+  'switzerland',
+  // Delhi NY and Delhi CA are real US towns, so bare 'delhi' only counts in the
+  // country position ("Palam, Delhi"). "New Delhi" is unambiguous and is in the
+  // anywhere-list above.
+  'delhi',
+];
+
+const escapeRe = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+const INTL_LOCATION_RE = new RegExp(`\\b(?:${INTL_LOCATION_MARKERS.map(escapeRe).join('|')})\\b`, 'i');
+// Final comma-segment, or the entire string ("Canada" / "Egypt" on their own).
+const INTL_TAIL_RE = new RegExp(`(?:^|,)\\s*(?:${INTL_TAIL_ONLY_MARKERS.map(escapeRe).join('|')})\\.?\\s*$`, 'i');
+
+// Indian postal format "City, State, IN", where IN is the ISO country code and
+// not Indiana. TWO commas are required, so one-comma "Columbus, IN" — a real
+// Indiana town — never matches. Runs BEFORE the US city markers on purpose:
+// Salem is both an Indian city and a US one, and in this shape it is India.
+// Accepted limitation: a US location written "Fort Wayne, Allen County, IN"
+// has the same shape and is dropped. County-form locations are rare enough in
+// parsed resumes to accept; the alternative is misreading every Indian address.
+const INDIA_COUNTRY_CODE_RE = /,.+,\s+IN\s*$/i;
+
+// Major US cities and country identifiers. Word-bounded for the same reason as
+// above — bare 'usa' matches "Wausau, WI".
+const US_CITY_MARKERS = [
+  'united states', 'usa', 'u.s.a',
+  'new york', 'los angeles', 'chicago', 'houston', 'phoenix', 'philadelphia',
+  'san antonio', 'san diego', 'dallas', 'san jose', 'austin', 'jacksonville',
+  'fort worth', 'columbus', 'charlotte', 'indianapolis', 'san francisco',
+  'seattle', 'denver', 'nashville', 'boston', 'detroit', 'memphis', 'portland',
+  'las vegas', 'louisville', 'baltimore', 'milwaukee', 'albuquerque', 'tucson',
+  'fresno', 'sacramento', 'mesa', 'kansas city', 'atlanta', 'omaha', 'raleigh',
+  'miami', 'minneapolis', 'cleveland', 'wichita', 'arlington', 'tampa',
+];
+const US_CITY_RE = new RegExp(`\\b(?:${US_CITY_MARKERS.map(escapeRe).join('|')})\\b`, 'i');
+
+// Two-letter state code after a comma. Fires only AFTER the international
+// checks, so the codes that double as country abbreviations (IN = Indiana and
+// India) are already defused. Verified 2026-08-20: no Canadian province code
+// (AB BC MB NB NL NS NT NU ON PE QC SK YT) collides with any entry here, so a
+// Canadian location reaches the fail-open branch rather than being read as US.
+const US_STATE_RE = /,\s+(?:AL|AK|AZ|AR|CA|CO|CT|DE|FL|GA|HI|ID|IL|IN|IA|KS|KY|LA|ME|MD|MA|MI|MN|MS|MO|MT|NE|NV|NH|NJ|NM|NY|NC|ND|OH|OK|OR|PA|RI|SC|SD|TN|TX|UT|VT|VA|WA|WV|WI|WY|DC)\b/i;
+
+// The same 50 states spelled out. Plenty of resumes write "Cincinnati, Ohio"
+// rather than "Cincinnati, OH", and without this they land on the fail-open
+// branch — kept, but by luck rather than by signal (53 such leads on
+// 2026-08-20). Runs AFTER every international check, which is what makes
+// 'georgia' safe to include: the country Georgia is in no marker list, so
+// "Tbilisi, Georgia" is kept by this line. That is the fail-open bargain
+// working as designed, not a misread — the alternative drops Atlanta.
+const US_STATE_NAMES = [
+  'alabama', 'alaska', 'arizona', 'arkansas', 'california', 'colorado',
+  'connecticut', 'delaware', 'florida', 'georgia', 'hawaii', 'idaho',
+  'illinois', 'indiana', 'iowa', 'kansas', 'kentucky', 'louisiana', 'maine',
+  'maryland', 'massachusetts', 'michigan', 'minnesota', 'mississippi',
+  'missouri', 'montana', 'nebraska', 'nevada', 'new hampshire', 'new jersey',
+  'new mexico', 'new york', 'north carolina', 'north dakota', 'ohio',
+  'oklahoma', 'oregon', 'pennsylvania', 'rhode island', 'south carolina',
+  'south dakota', 'tennessee', 'texas', 'utah', 'vermont', 'virginia',
+  'washington', 'west virginia', 'wisconsin', 'wyoming',
+];
+const US_STATE_NAME_RE = new RegExp(`\\b(?:${US_STATE_NAMES.map(escapeRe).join('|')})\\b`, 'i');
+
 let _client = null;
 
 function getSupabase() {
@@ -87,12 +285,17 @@ function getSupabase() {
  * Anything that isn't a plain integer ≥ 1 falls back to normal mode with a
  * warning; a value above the maximum is clamped rather than rejected.
  */
-function computeWindow(nowMs, env = process.env) {
-  const endMs = nowMs - SETTLE_MS;
+function computeWindow(nowMs, env = process.env, stageArg = DEFAULT_STAGE) {
+  const stage = resolveStage(stageArg);
+  // The upper bound IS the stage delay: the 1h email considers surveys that
+  // settled an hour ago, the 24h email those that settled a day ago. For the
+  // first stage this is SETTLE_MS, so the bounds are unchanged from launch.
+  const endMs = nowMs - stage.delayMs;
   const normal = {
     mode: 'normal',
+    stage: stage.id,
     backfillDays: null,
-    startMs: nowMs - NORMAL_LOOKBACK_MS,
+    startMs: endMs - spanForStage(stage),
     endMs,
     warning: null,
   };
@@ -126,8 +329,12 @@ function computeWindow(nowMs, env = process.env) {
   const days = Math.min(requested, MAX_BACKFILL_DAYS);
   return withIso({
     mode: 'backfill',
+    stage: stage.id,
     backfillDays: days,
-    startMs: nowMs - days * ONE_DAY_MS,
+    // Clamped so a backfill shorter than the stage delay still yields a real
+    // window instead of an inverted one: BACKFILL_DAYS=1 on the 48h stage would
+    // otherwise ask for [now−24h, now−48h] and silently match nothing.
+    startMs: Math.min(nowMs - days * ONE_DAY_MS, endMs - spanForStage(stage)),
     endMs,
     warning:
       days === requested
@@ -522,6 +729,58 @@ function optInTime(lead) {
   return Number.isFinite(t) ? t : 0;
 }
 
+/**
+ * Two-signal heuristic: is this lead plausibly US-based?
+ *
+ * Signal A — phone country code. Only a leading '+' is trusted; a bare
+ *   "91-9999999999" proves nothing next to a US extension or an 800 number, so
+ *   those fall through to Signal B. Any known non-US code is a hard drop.
+ * Signal B — location string, checked in this exact order:
+ *   1. International country name (word-bounded, anywhere) → not US.
+ *   2. International country name in the country position (final segment or
+ *      whole string), for names that are also US towns → not US.
+ *   3. Indian "City, State, IN" postal format → not US.
+ *   4. US city name or "United States" / "USA" → US.
+ *   5. US state abbreviation (", TX") → US.
+ *   6. US state spelled out ("Cincinnati, Ohio") → US.
+ *   7. Location present but unrecognised ("Remote", "Worldwide") → fail open.
+ *
+ * Fail-open rule: no phone signal AND no usable location → treat as US-based
+ * and send. See the constants block above for why the asymmetry is deliberate,
+ * and for why Canada rides this branch by design.
+ *
+ * Pure: no env, no network, no logging, does not mutate the lead.
+ */
+function isUsBasedLead(lead) {
+  const rp = lead && lead.resume_parsed;
+  // Defensive only — leadFromSurvey never emits a lead without a parsed object.
+  if (!rp || typeof rp !== 'object') return true;
+
+  // Signal A: phone country code. Strip the separators resumes sprinkle through
+  // a number first, so "+91 (987)…", "+91-987…", "(+91) 987…" and even the
+  // digit-spaced "+9 1 9 8 7…" all compare the same as "+91987…". The '+' is
+  // checked AFTER stripping, because a leading "(" would otherwise hide it.
+  const phone = typeof rp.phone === 'string' ? rp.phone.trim() : '';
+  const compact = phone.replace(/[\s().-]/g, '');
+  if (compact.startsWith('+')) {
+    if (NON_US_PHONE_PREFIXES_DESC.some((p) => compact.startsWith(p))) return false;
+  }
+
+  // Signal B: location string.
+  const loc = typeof rp.location === 'string' ? rp.location.trim() : '';
+  if (loc) {
+    if (INTL_LOCATION_RE.test(loc)) return false;
+    if (INTL_TAIL_RE.test(loc)) return false;
+    if (INDIA_COUNTRY_CODE_RE.test(loc)) return false;
+    if (US_CITY_RE.test(loc)) return true;
+    if (US_STATE_RE.test(loc)) return true;
+    if (US_STATE_NAME_RE.test(loc)) return true;
+    return true; // present but unrecognised — fail open
+  }
+
+  return true; // no signal at all — fail open
+}
+
 // PostgREST hands the pattern straight to ilike, so a stray % or _ inside an
 // address would widen the match. Over-matching here only ever suppresses a
 // send, but it costs nothing to neutralise.
@@ -559,11 +818,17 @@ async function emailsPresentIn(table, emailsLc, refine) {
 }
 
 /**
- * Emails we must not mail, unioned from four sources:
+ * Emails we must not mail, unioned from three sources:
  *   a) profiles          — they already have an account (case-insensitive)
  *   b) marketing_suppressions — unsubscribed / bounced / complained
  *   c) pending_subscriptions  — recent *paid* checkout, by session or email
- *   d) free_apply_grants      — already granted a free apply
+ *
+ * free_apply_grants was a fourth source until 2026-08-21 and is deliberately
+ * gone. Claiming the free apply happens on /your-match — the destination of
+ * Email 1's own CTA — so excluding grant holders meant that clicking the first
+ * email ended the sequence. That silently dropped the warmest cohort in the
+ * audience (engaged, claimed, did not convert) while the later emails went
+ * only to leads who had ignored us entirely. Owner decision: they stay in.
  */
 async function findExclusions(candidates) {
   const supabase = getSupabase();
@@ -605,18 +870,49 @@ async function findExclusions(candidates) {
   const inCheckout = await emailsPresentIn('pending_subscriptions', emailsLc, refineCheckout);
   for (const e of inCheckout) excluded.add(e);
 
-  // Ships with the main-repo migration; until then treat as "no grants yet".
-  const { data: granted, error: grantError } = await supabase
-    .from('free_apply_grants')
-    .select('email_lc')
-    .in('email_lc', emailsLc);
-  if (grantError) {
-    console.warn(`[queries] free_apply_grants unavailable (${grantError.message}) — skipping that exclusion.`);
-  } else {
-    for (const row of granted || []) excluded.add(String(row.email_lc).toLowerCase());
+  return excluded;
+}
+
+/**
+ * Send-time paid re-check for ONE lead. findExclusions builds the cohort when
+ * the run starts; a long run (or a backfill draining a large window) can put
+ * minutes between that query and the actual dispatch, and a lead who paid in
+ * the gap must not receive an abandonment email. Mirrors the paid half of
+ * findExclusions — profiles, then pending_subscriptions by session and by
+ * email — and deliberately not the suppression half, which findExclusions
+ * already covers and which cannot change mid-run in a way that matters.
+ *
+ * Throws rather than returning false on a query error: the caller treats a
+ * failed re-check as "defer this lead", so a Supabase blip skips the send and
+ * the next hourly run retries. Failing closed is right here — nothing is
+ * marked sent, so nobody is lost.
+ */
+async function isStillUnpaid(lead) {
+  const supabase = getSupabase();
+  const emailLc = lead.email_lc;
+
+  const inProfiles = await emailsPresentIn('profiles', [emailLc]);
+  if (inProfiles.size > 0) return false;
+
+  const checkoutSince = new Date(Date.now() - SEVEN_DAYS_MS).toISOString();
+
+  if (lead.session_id) {
+    const { data, error } = await supabase
+      .from('pending_subscriptions')
+      .select('session_id')
+      .in('status', PAID_CHECKOUT_STATUSES)
+      .gt('created_at', checkoutSince)
+      .eq('session_id', lead.session_id)
+      .limit(1);
+    if (error) throw new Error(`pending_subscriptions re-check failed: ${error.message}`);
+    if ((data || []).length > 0) return false;
   }
 
-  return excluded;
+  // Same late-email caveat as findExclusions: Stripe reports the address after
+  // the session, so the session join alone can miss a checkout.
+  const refineCheckout = (q) => q.in('status', PAID_CHECKOUT_STATUSES).gt('created_at', checkoutSince);
+  const inCheckout = await emailsPresentIn('pending_subscriptions', [emailLc], refineCheckout);
+  return inCheckout.size === 0;
 }
 
 /**
@@ -680,8 +976,9 @@ async function fetchSurveyRows(win) {
  * what this function owns is the one drop the caller cannot see, because the
  * exclusion set is discarded here.
  */
-async function findAnonLeads(windowOverride, targetingOverride) {
-  const win = windowOverride || computeWindow(Date.now(), process.env);
+async function findAnonLeads(windowOverride, targetingOverride, stageArg = DEFAULT_STAGE) {
+  const stage = resolveStage(stageArg);
+  const win = windowOverride || computeWindow(Date.now(), process.env, stage);
   if (!windowOverride && win.warning) console.warn(`[queries] ${win.warning}`);
   const targeting = targetingOverride || parseTargetEmails(process.env);
 
@@ -698,14 +995,24 @@ async function findAnonLeads(windowOverride, targetingOverride) {
 
   const candidates = [...byEmail.values()].sort(byCreatedAtDesc);
   console.log(
-    `[queries] mode=${win.mode} window=${win.startIso} → ${win.endIso}: ` +
+    `[queries] stage=${stage.id} (${stage.label}) mode=${win.mode} ` +
+      `window=${win.startIso} → ${win.endIso}: ` +
       `${rows.length} opted-in anonymous survey(s) → ${candidates.length} candidate lead(s).`
   );
   if (candidates.length === 0) return [];
 
   const excluded = await findExclusions(candidates);
   const kept = candidates.filter((lead) => !excluded.has(lead.email_lc));
-  console.log(`[queries] ${excluded.size} candidate(s) excluded → ${kept.length} lead(s) remain.`);
+
+  // Geography gate: the featured job comes from a US ATS board, so an
+  // international lead gets an email it cannot act on. Fails open — see
+  // isUsBasedLead. Canadian leads are deliberately kept (owner, 2026-08-20).
+  const usLeads = kept.filter((lead) => isUsBasedLead(lead));
+  const intlDropped = kept.length - usLeads.length;
+  console.log(
+    `[queries] ${excluded.size} candidate(s) excluded → ${kept.length} remain → ` +
+      `${intlDropped} dropped as international → ${usLeads.length} lead(s) eligible.`
+  );
 
   // The exclusion set is counted, never named, and then thrown away — so an
   // excluded lead is indistinguishable downstream from one that was never in
@@ -718,13 +1025,29 @@ async function findAnonLeads(windowOverride, targetingOverride) {
       console.warn(
         `[queries] TARGETED MODE: ${excludedTargets.length} target(s) dropped by the exclusion ` +
           `set — ${excludedTargets.join(', ')}. That means they already have a profile, are in ` +
-          'marketing_suppressions, have a paid checkout in the last 7 days, or already hold a ' +
-          'free_apply_grants row. This is a rail, not a bug: it fires in targeted mode too.'
+          'marketing_suppressions, or have a paid checkout in the last 7 days. This is a rail, ' +
+          'not a bug: it fires in targeted mode too.'
       );
     }
   }
 
-  return kept;
+  // Same diagnostic duty as the block above: in targeted mode a silent drop is
+  // the entire mystery, so name the targets geography ate. The keptSet guard
+  // stops a target the exclusion set already removed being reported twice.
+  if (targeting.active && intlDropped > 0) {
+    const keptSet = new Set(kept.map((l) => l.email_lc));
+    const usSet = new Set(usLeads.map((l) => l.email_lc));
+    const intlTargets = targeting.targets.filter((t) => keptSet.has(t) && !usSet.has(t));
+    if (intlTargets.length > 0) {
+      console.warn(
+        `[queries] TARGETED MODE: ${intlTargets.length} target(s) dropped as international — ` +
+          `${intlTargets.join(', ')}. Their resume phone or location reads as outside the US. ` +
+          'This is a rail, not a bug: it fires in targeted mode too.'
+      );
+    }
+  }
+
+  return usLeads;
 }
 
 /**
@@ -928,9 +1251,22 @@ module.exports = {
   findExclusions,
   MATCH_CONCURRENCY,
   RUN_BUDGET_MS,
+  isStillUnpaid,
+  capForStage,
+  EMAIL_STAGES_ORDER: STAGE_ORDER,
   _internals: {
     parseResume,
     leadFromSurvey,
+    NORMAL_SPAN_MS,
+    isUsBasedLead,
+    NON_US_PHONE_PREFIXES,
+    INTL_LOCATION_MARKERS,
+    INTL_TAIL_ONLY_MARKERS,
+    INDIA_COUNTRY_CODE_RE,
+    US_CITY_MARKERS,
+    US_STATE_RE,
+    US_STATE_NAMES,
+    US_STATE_NAME_RE,
     optInTime,
     escapeLike,
     byCreatedAtDesc,
