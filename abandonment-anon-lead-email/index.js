@@ -19,7 +19,7 @@ const { generateMatchReasons } = require('./match-reason');
 const { sendJobEmail } = require('./brevo');
 const { signLeadToken, decodeLeadToken } = require('./lead-token');
 const sentTracker = require('./sent-tracker');
-const { resolveStage, resolveTemplateId, STAGE_ORDER } = require('./stages');
+const { resolveStage, resolveTemplateId, STAGE_ORDER, capForStage } = require('./stages');
 
 // ---------------------------------------------------------------------------
 // Anonymous-lead re-engagement.
@@ -288,7 +288,17 @@ async function run() {
     console.warn(`[abandonment-anon-lead-email] ${detail} Dry run continues.`);
   }
 
-  const cap = capForDedupAction(requestedCap, dedup.action);
+  // Two ceilings, both of which can only tighten: the dedup guard's, and the
+  // stage's own. The 48h email pays for an LLM call per recipient, so it cannot
+  // work the whole cohort the way a template-only email can.
+  const dedupCap = capForDedupAction(requestedCap, dedup.action);
+  const cap = capForStage(dedupCap, stage);
+  if (cap !== dedupCap) {
+    console.log(
+      `[abandonment-anon-lead-email] Stage ${stage.id} caps this run at ${cap} ` +
+        `(was ${dedupCap === null ? 'uncapped' : dedupCap}). Leads past the cap are left for later runs.`
+    );
+  }
   const capLabel = cap === null ? 'none' : String(cap);
 
   if (dedup.action === 'warn') {

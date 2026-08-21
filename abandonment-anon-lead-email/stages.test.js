@@ -15,7 +15,16 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 
-const { EMAIL_STAGES, STAGE_ORDER, DEFAULT_STAGE, resolveStage, resolveTemplateId } = require('./stages');
+const {
+  EMAIL_STAGES,
+  STAGE_ORDER,
+  DEFAULT_STAGE,
+  resolveStage,
+  resolveTemplateId,
+  capForStage,
+  LAUNCH_SPAN_MS,
+  RETRY_SPAN_MS,
+} = require('./stages');
 const { kvKeyFor } = require('./sent-tracker');
 const { computeWindow } = require('./queries');
 
@@ -74,14 +83,50 @@ test('a staging key can never collide with a production key', () => {
 
 // --- Windows ---------------------------------------------------------------
 
-test('computeWindow: each stage selects the hour that ended delayMs ago', () => {
+test('computeWindow: each stage selects the slice that ended delayMs ago', () => {
   for (const id of STAGE_ORDER) {
     const stage = EMAIL_STAGES[id];
     const win = computeWindow(NOW, {}, stage);
     assert.equal(win.endMs, NOW - stage.delayMs, `${id} upper bound is the stage delay`);
-    assert.equal(win.endMs - win.startMs, HOUR, `${id} cohort is exactly one hourly bucket`);
+    assert.equal(win.endMs - win.startMs, stage.spanMs, `${id} cohort is exactly its own span`);
     assert.equal(win.stage, id);
   }
+});
+
+test('the launch stage keeps its one-hour span; the new stages get a retry budget', () => {
+  // Widening `first` is the right fix for the same silent loss, but it changes
+  // a live email's behaviour and earns a one-off catch-up cohort. Deliberate.
+  assert.equal(EMAIL_STAGES.first.spanMs, LAUNCH_SPAN_MS);
+  assert.equal(LAUNCH_SPAN_MS, HOUR);
+  assert.equal(EMAIL_STAGES.day1.spanMs, RETRY_SPAN_MS);
+  assert.equal(EMAIL_STAGES.day2.spanMs, RETRY_SPAN_MS);
+  assert.ok(RETRY_SPAN_MS > LAUNCH_SPAN_MS);
+});
+
+test('a deferred lead at a retry-span stage is still in range an hour later', () => {
+  // The whole point of spanMs. A lead the run defers is left unmarked so the
+  // next tick can pick it up — which only works if the window still covers it.
+  const stage = EMAIL_STAGES.day2;
+  const survey = NOW - stage.delayMs - 30 * 60 * 1000; // mid-window
+  let covered = 0;
+  for (let n = 0; n < 3; n++) {
+    const win = computeWindow(NOW + n * HOUR, {}, stage);
+    if (survey >= win.startMs && survey <= win.endMs) covered++;
+  }
+  assert.equal(covered, 3, 'three hourly runs should each still see this lead');
+});
+
+test('the launch stage gets exactly one chance — the known limitation', () => {
+  // Documented rather than fixed, so the asymmetry is visible instead of
+  // being mistaken for an oversight.
+  const stage = EMAIL_STAGES.first;
+  const survey = NOW - stage.delayMs - 30 * 60 * 1000;
+  let covered = 0;
+  for (let n = 0; n < 3; n++) {
+    const win = computeWindow(NOW + n * HOUR, {}, stage);
+    if (survey >= win.startMs && survey <= win.endMs) covered++;
+  }
+  assert.equal(covered, 1, 'a deferred 1h lead falls out of range next tick');
 });
 
 test('computeWindow: the two-argument call is byte-identical to the 1h stage', () => {
@@ -104,7 +149,7 @@ test('computeWindow: backfill on a later stage is clamped, never inverted', () =
   // BACKFILL_DAYS=1 against the 48h stage asks for [now-24h, now-48h].
   const win = computeWindow(NOW, { BACKFILL_DAYS: '1' }, EMAIL_STAGES.day2);
   assert.ok(win.startMs < win.endMs, 'an inverted window silently matches nothing');
-  assert.equal(win.endMs - win.startMs, HOUR, 'falls back to the normal one-hour cohort');
+  assert.equal(win.endMs - win.startMs, EMAIL_STAGES.day2.spanMs, "falls back to the stage's own span");
 });
 
 test('computeWindow: a real backfill on the 1h stage is unchanged', () => {
@@ -147,6 +192,23 @@ test('resolveTemplateId returns null when the template is unconfigured', () => {
 test('every stage points at a distinct template env var', () => {
   const envs = STAGE_ORDER.map((id) => EMAIL_STAGES[id].templateEnv);
   assert.equal(new Set(envs).size, envs.length, 'two stages sharing a template would send the wrong copy');
+});
+
+// --- Per-stage send ceiling ------------------------------------------------
+
+test('capForStage tightens an uncapped run at the tailoring stage', () => {
+  assert.equal(capForStage(null, EMAIL_STAGES.day2), 10, 'one LLM call per recipient, 280s budget');
+});
+
+test('capForStage leaves stages without a ceiling alone', () => {
+  assert.equal(capForStage(null, EMAIL_STAGES.first), null);
+  assert.equal(capForStage(50, EMAIL_STAGES.day1), 50);
+});
+
+test('capForStage never widens an operator cap', () => {
+  // A stage ceiling is a rail: it can only ever reduce.
+  assert.equal(capForStage(3, EMAIL_STAGES.day2), 3, 'a tighter SEND_CAP wins');
+  assert.equal(capForStage(200, EMAIL_STAGES.day2), 10, 'a looser one is pulled down');
 });
 
 test('the deferred 72h discount stage is not defined yet', () => {

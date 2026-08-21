@@ -18,8 +18,30 @@
  *               calls this key `anon_lead_1h_sent`; the spec is wrong.
  *
  *   delayMs     How long after the survey was created this email goes out, and
- *               therefore which one-hour slice of surveys each hourly run
- *               considers. See computeWindow in queries.js.
+ *               therefore which slice of surveys each hourly run considers.
+ *               See computeWindow in queries.js.
+ *
+ *   spanMs      How wide that slice is. This is a RETRY BUDGET, not a cohort
+ *               size. A lead the run defers — budget exhausted, tailoring
+ *               unavailable, a failed paid re-check — is left unmarked so it
+ *               can be picked up again, but with a one-hour span the window
+ *               has moved past them by the next tick and they are lost
+ *               silently. A three-hour span gives each lead three chances.
+ *               Widening is safe because the send-once receipt is per stage
+ *               and durable, and partitionBySentTracker drops already-sent
+ *               leads BEFORE the match fan-out, so the extra width costs KV
+ *               reads rather than vector searches.
+ *
+ *               Stage `first` deliberately keeps the one-hour span it has
+ *               used since launch. Widening it is the right fix for the same
+ *               silent loss, but it changes the behaviour of a live email and
+ *               the first run afterwards sees a one-off catch-up cohort — do
+ *               that deliberately, with a SEND_CAP, not as a side effect.
+ *
+ *   maxPerRun   A hard ceiling on real sends per run for this stage, applied
+ *               on top of SEND_CAP. The 48h email makes an LLM call per
+ *               recipient inside a 280s budget, so it cannot use the whole
+ *               cohort the way a template-only email can.
  *
  * The 72h discount email is deliberately absent: it is blocked on Stripe
  * coupon infrastructure and ships separately (owner decision 2026-08-21).
@@ -27,11 +49,18 @@
 
 const ONE_HOUR_MS = 60 * 60 * 1000;
 
+// The launch span. Kept for stage `first` so its live behaviour is untouched.
+const LAUNCH_SPAN_MS = ONE_HOUR_MS;
+// Three chances at each new stage before a deferred lead falls out of range.
+const RETRY_SPAN_MS = 3 * ONE_HOUR_MS;
+
 const EMAIL_STAGES = Object.freeze({
   first: Object.freeze({
     id: 'first',
     label: '1h',
     delayMs: ONE_HOUR_MS,
+    spanMs: LAUNCH_SPAN_MS,
+    maxPerRun: null,
     kvKey: 'anon_lead_sent',
     templateEnv: 'BREVO_TEMPLATE_ID_ANON_LEAD',
   }),
@@ -39,6 +68,8 @@ const EMAIL_STAGES = Object.freeze({
     id: 'day1',
     label: '24h',
     delayMs: 24 * ONE_HOUR_MS,
+    spanMs: RETRY_SPAN_MS,
+    maxPerRun: null,
     kvKey: 'anon_lead_24h_sent',
     templateEnv: 'BREVO_TEMPLATE_ID_ANON_LEAD_24H',
   }),
@@ -46,6 +77,10 @@ const EMAIL_STAGES = Object.freeze({
     id: 'day2',
     label: '48h',
     delayMs: 48 * ONE_HOUR_MS,
+    spanMs: RETRY_SPAN_MS,
+    // One tailoring call per recipient against a 280s budget. Start low and
+    // raise it once deferredByBudget shows there is headroom.
+    maxPerRun: 10,
     kvKey: 'anon_lead_48h_sent',
     templateEnv: 'BREVO_TEMPLATE_ID_ANON_LEAD_48H',
   }),
@@ -88,8 +123,22 @@ function resolveTemplateId(stage, env = process.env) {
   return Number.isFinite(id) && id > 0 ? id : null;
 }
 
+/**
+ * The per-stage ceiling applied on top of SEND_CAP. Pure. Returns the tighter
+ * of the two, and never widens an operator's explicit cap — a stage ceiling is
+ * a rail, so it can only ever reduce.
+ */
+function capForStage(cap, stage) {
+  const max = resolveStage(stage).maxPerRun;
+  if (!max) return cap;
+  return cap === null ? max : Math.min(cap, max);
+}
+
 module.exports = {
   EMAIL_STAGES,
+  capForStage,
+  LAUNCH_SPAN_MS,
+  RETRY_SPAN_MS,
   STAGE_ORDER,
   DEFAULT_STAGE,
   resolveStage,

@@ -1,5 +1,5 @@
 const { createClient } = require('@supabase/supabase-js');
-const { DEFAULT_STAGE, resolveStage, STAGE_ORDER } = require('./stages');
+const { DEFAULT_STAGE, resolveStage, STAGE_ORDER, capForStage } = require('./stages');
 
 const ONE_HOUR_MS = 60 * 60 * 1000;
 const ONE_DAY_MS = 24 * ONE_HOUR_MS;
@@ -21,10 +21,12 @@ const SETTLE_MS = ONE_HOUR_MS;
 // Normal mode looks back exactly one hour further, so the hourly cron considers
 // every survey exactly once.
 const NORMAL_LOOKBACK_MS = 2 * ONE_HOUR_MS;
-// The width of one normal-mode cohort: exactly one hourly bucket. Derived, not
-// restated, so a stage's window is always "the hour that ended delayMs ago"
-// however SETTLE_MS and NORMAL_LOOKBACK_MS move.
+// The width of one normal-mode cohort for a stage that does not set its own.
+// Derived, not restated, so the launch stage's window stays "the hour that
+// ended delayMs ago" however SETTLE_MS and NORMAL_LOOKBACK_MS move. Stages
+// override it with spanMs — see the retry-budget note in stages.js.
 const NORMAL_SPAN_MS = NORMAL_LOOKBACK_MS - SETTLE_MS;
+const spanForStage = (stage) => stage.spanMs || NORMAL_SPAN_MS;
 const MIN_BACKFILL_DAYS = 1;
 const MAX_BACKFILL_DAYS = 30;
 // Backfill cohorts are large; bound the real sends per run so one invocation
@@ -293,7 +295,7 @@ function computeWindow(nowMs, env = process.env, stageArg = DEFAULT_STAGE) {
     mode: 'normal',
     stage: stage.id,
     backfillDays: null,
-    startMs: endMs - NORMAL_SPAN_MS,
+    startMs: endMs - spanForStage(stage),
     endMs,
     warning: null,
   };
@@ -332,7 +334,7 @@ function computeWindow(nowMs, env = process.env, stageArg = DEFAULT_STAGE) {
     // Clamped so a backfill shorter than the stage delay still yields a real
     // window instead of an inverted one: BACKFILL_DAYS=1 on the 48h stage would
     // otherwise ask for [now−24h, now−48h] and silently match nothing.
-    startMs: Math.min(nowMs - days * ONE_DAY_MS, endMs - NORMAL_SPAN_MS),
+    startMs: Math.min(nowMs - days * ONE_DAY_MS, endMs - spanForStage(stage)),
     endMs,
     warning:
       days === requested
@@ -1250,6 +1252,7 @@ module.exports = {
   MATCH_CONCURRENCY,
   RUN_BUDGET_MS,
   isStillUnpaid,
+  capForStage,
   EMAIL_STAGES_ORDER: STAGE_ORDER,
   _internals: {
     parseResume,
