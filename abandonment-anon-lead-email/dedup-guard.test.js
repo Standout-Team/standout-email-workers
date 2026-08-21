@@ -143,6 +143,11 @@ const GUARDED_ENV = [
   'DRY_RUN',
   'BACKFILL_DAYS',
   'SEND_CAP',
+  // A real run refuses to start without a template for its stage, so these
+  // drives have to own both — and clear them, so an EMAIL_STAGE left in the
+  // ambient environment cannot silently point a drive at another stage.
+  'EMAIL_STAGE',
+  'BREVO_TEMPLATE_ID_ANON_LEAD',
 ];
 
 // run() reads all of these at call time, so setting them here beats whatever
@@ -214,6 +219,7 @@ test('run(): with KV configured the cap is untouched and dedup reports durable',
       KV_REST_API_TOKEN: 'stub-token',
       VERCEL: '1',
       DRY_RUN: 'false',
+      BREVO_TEMPLATE_ID_ANON_LEAD: '39',
     },
     () => run()
   );

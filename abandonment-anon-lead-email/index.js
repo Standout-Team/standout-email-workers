@@ -13,11 +13,13 @@ const {
   filterToTargets,
   findAnonLeads,
   findFeaturedJobs,
+  isStillUnpaid,
 } = require('./queries');
 const { generateMatchReasons } = require('./match-reason');
 const { sendJobEmail } = require('./brevo');
 const { signLeadToken, decodeLeadToken } = require('./lead-token');
 const sentTracker = require('./sent-tracker');
+const { resolveStage, resolveTemplateId, STAGE_ORDER } = require('./stages');
 
 // ---------------------------------------------------------------------------
 // Anonymous-lead re-engagement.
@@ -105,7 +107,7 @@ function buildLinks(lead, job) {
   return { token, jobUrl, matchesUrl };
 }
 
-function buildPayload(lead, job, pct, reasons, links) {
+function buildPayload(lead, job, pct, reasons, links, stage) {
   const firstName = firstNameFor(lead.name);
 
   const params = {
@@ -126,7 +128,10 @@ function buildPayload(lead, job, pct, reasons, links) {
   if (salary) params.SALARY_RANGE = salary;
 
   return {
-    templateId: process.env.BREVO_TEMPLATE_ID_ANON_LEAD,
+    // Per stage, not per worker: each email in the sequence has its own Brevo
+    // template. run() has already refused to start if this is unset, so the
+    // null case cannot reach a send.
+    templateId: resolveTemplateId(stage, process.env),
     to: [{ email: lead.email, name: firstName }],
     params,
   };
@@ -146,7 +151,7 @@ function buildPayload(lead, job, pct, reasons, links) {
  * most likely outcome of a support resend request — so a targeted run has to be
  * able to say which target it was.
  */
-async function partitionBySentTracker(leads) {
+async function partitionBySentTracker(leads, stage) {
   const unsent = [];
   const alreadySentEmails = [];
   let alreadySent = 0;
@@ -157,7 +162,7 @@ async function partitionBySentTracker(leads) {
     const states = await Promise.all(
       chunk.map(async (lead) => {
         try {
-          return (await sentTracker.hasBeenSent(lead.email_lc)) ? 'sent' : 'unsent';
+          return (await sentTracker.hasBeenSent(lead.email_lc, stage)) ? 'sent' : 'unsent';
         } catch (err) {
           console.error(
             `[abandonment-anon-lead-email] sent-tracker lookup failed for ${lead.email_lc}, deferring:`,
@@ -188,7 +193,17 @@ async function run() {
   const runStartMs = Date.now();
   const dryRun = isDryRun();
 
-  const win = computeWindow(runStartMs, process.env);
+  // Which email in the sequence this invocation is sending. One cron entry per
+  // stage, each pinning EMAIL_STAGE; an unset value is the 1h email, so the
+  // existing cron keeps behaving exactly as it did before the sequence existed.
+  const stage = resolveStage(process.env.EMAIL_STAGE);
+  const templateId = resolveTemplateId(stage, process.env);
+  console.log(
+    `[abandonment-anon-lead-email] Stage ${stage.id} (${stage.label}) — ` +
+      `Brevo template ${templateId ?? '(unset)'}.`
+  );
+
+  const win = computeWindow(runStartMs, process.env, stage);
   if (win.warning) console.warn(`[abandonment-anon-lead-email] ${win.warning}`);
   const { cap: requestedCap, warning: capWarning } = resolveSendCap(process.env, win.mode);
   if (capWarning) console.warn(`[abandonment-anon-lead-email] ${capWarning}`);
@@ -256,6 +271,23 @@ async function run() {
     throw new Error(`Refusing to send with non-durable dedup: ${dedup.reason}`);
   }
 
+  // Checked after the dedup guard on purpose: that rail protects the list from
+  // being re-mailed and stays the first thing to trip. This one only protects
+  // the run from a deploy mistake. A dry run needs no template, so it warns
+  // instead — that is how you rehearse a new stage before its template exists.
+  if (!templateId) {
+    const detail =
+      `Stage "${stage.id}" (${stage.label}) has no Brevo template — set ${stage.templateEnv}. ` +
+      `Known stages: ${STAGE_ORDER.join(', ')}.`;
+    if (!dryRun) {
+      // Refuse the whole run rather than let Brevo reject each send one at a
+      // time: a cohort of individual failures buries the real cause. Nothing is
+      // marked sent, so the next run recovers once the env var lands.
+      throw new Error(detail);
+    }
+    console.warn(`[abandonment-anon-lead-email] ${detail} Dry run continues.`);
+  }
+
   const cap = capForDedupAction(requestedCap, dedup.action);
   const capLabel = cap === null ? 'none' : String(cap);
 
@@ -305,7 +337,7 @@ async function run() {
 
   let eligible;
   try {
-    eligible = await findAnonLeads(win, targeting);
+    eligible = await findAnonLeads(win, targeting, stage);
   } catch (err) {
     console.error('[abandonment-anon-lead-email] Supabase query failed, aborting run:', err.message);
     throw err;
@@ -351,7 +383,7 @@ async function run() {
     return summary;
   }
 
-  const { unsent, alreadySent, alreadySentEmails, trackerErrors } = await partitionBySentTracker(eligible);
+  const { unsent, alreadySent, alreadySentEmails, trackerErrors } = await partitionBySentTracker(eligible, stage);
 
   // Under KV the sent-tracker drops a lead without a word. In targeted mode
   // every lead here IS a target, so a hit is the answer to "why did my resend
@@ -427,7 +459,7 @@ async function run() {
       }
 
       const reasons = await generateMatchReasons(lead.resume_parsed, job);
-      const payload = buildPayload(lead, job, pct, reasons, links);
+      const payload = buildPayload(lead, job, pct, reasons, links, stage);
 
       if (dryRun) {
         console.log(
@@ -441,18 +473,42 @@ async function run() {
         continue;
       }
 
-      // One send per lead email, ever. partitionBySentTracker already dropped
-      // the known-sent; this re-check closes the window between that partition
-      // and this send (overlapping cron runs, a long backfill invocation).
-      const alreadyMailed = await sentTracker.hasBeenSent(lead.email_lc);
+      // One send per lead email per stage, ever. partitionBySentTracker
+      // already dropped the known-sent; this re-check closes the window between
+      // that partition and this send (overlapping cron runs, a long backfill).
+      const alreadyMailed = await sentTracker.hasBeenSent(lead.email_lc, stage);
       if (alreadyMailed) {
         console.log(`[abandonment-anon-lead-email] Already sent to ${lead.email_lc}, skipping.`);
         skipped++;
         continue;
       }
 
+      // The cohort's exclusions were resolved when the run began. A lead who
+      // paid since then must not get an abandonment email, and across a 24h or
+      // 48h stage that gap is the whole point — so re-ask right before we send.
+      // A failed check defers rather than sends: nothing is marked, so the next
+      // hourly run picks them up again.
+      let stillUnpaid;
+      try {
+        stillUnpaid = await isStillUnpaid(lead);
+      } catch (err) {
+        console.warn(
+          `[abandonment-anon-lead-email] paid re-check failed for ${lead.email_lc}, deferring:`,
+          err.message
+        );
+        skipped++;
+        continue;
+      }
+      if (!stillUnpaid) {
+        console.log(
+          `[abandonment-anon-lead-email] ${lead.email_lc} converted since the cohort was built, skipping.`
+        );
+        skipped++;
+        continue;
+      }
+
       const messageId = await sendJobEmail(payload);
-      await sentTracker.markSent(lead.email_lc, job.id);
+      await sentTracker.markSent(lead.email_lc, job.id, stage);
       sentCount++;
       console.log(
         `[abandonment-anon-lead-email] Sent to ${lead.email_lc} (messageId=${messageId}, jobId=${job.id})`

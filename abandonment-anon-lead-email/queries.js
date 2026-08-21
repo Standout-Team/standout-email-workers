@@ -1,4 +1,5 @@
 const { createClient } = require('@supabase/supabase-js');
+const { DEFAULT_STAGE, resolveStage, STAGE_ORDER } = require('./stages');
 
 const ONE_HOUR_MS = 60 * 60 * 1000;
 const ONE_DAY_MS = 24 * ONE_HOUR_MS;
@@ -20,6 +21,10 @@ const SETTLE_MS = ONE_HOUR_MS;
 // Normal mode looks back exactly one hour further, so the hourly cron considers
 // every survey exactly once.
 const NORMAL_LOOKBACK_MS = 2 * ONE_HOUR_MS;
+// The width of one normal-mode cohort: exactly one hourly bucket. Derived, not
+// restated, so a stage's window is always "the hour that ended delayMs ago"
+// however SETTLE_MS and NORMAL_LOOKBACK_MS move.
+const NORMAL_SPAN_MS = NORMAL_LOOKBACK_MS - SETTLE_MS;
 const MIN_BACKFILL_DAYS = 1;
 const MAX_BACKFILL_DAYS = 30;
 // Backfill cohorts are large; bound the real sends per run so one invocation
@@ -278,12 +283,17 @@ function getSupabase() {
  * Anything that isn't a plain integer ≥ 1 falls back to normal mode with a
  * warning; a value above the maximum is clamped rather than rejected.
  */
-function computeWindow(nowMs, env = process.env) {
-  const endMs = nowMs - SETTLE_MS;
+function computeWindow(nowMs, env = process.env, stageArg = DEFAULT_STAGE) {
+  const stage = resolveStage(stageArg);
+  // The upper bound IS the stage delay: the 1h email considers surveys that
+  // settled an hour ago, the 24h email those that settled a day ago. For the
+  // first stage this is SETTLE_MS, so the bounds are unchanged from launch.
+  const endMs = nowMs - stage.delayMs;
   const normal = {
     mode: 'normal',
+    stage: stage.id,
     backfillDays: null,
-    startMs: nowMs - NORMAL_LOOKBACK_MS,
+    startMs: endMs - NORMAL_SPAN_MS,
     endMs,
     warning: null,
   };
@@ -317,8 +327,12 @@ function computeWindow(nowMs, env = process.env) {
   const days = Math.min(requested, MAX_BACKFILL_DAYS);
   return withIso({
     mode: 'backfill',
+    stage: stage.id,
     backfillDays: days,
-    startMs: nowMs - days * ONE_DAY_MS,
+    // Clamped so a backfill shorter than the stage delay still yields a real
+    // window instead of an inverted one: BACKFILL_DAYS=1 on the 48h stage would
+    // otherwise ask for [now−24h, now−48h] and silently match nothing.
+    startMs: Math.min(nowMs - days * ONE_DAY_MS, endMs - NORMAL_SPAN_MS),
     endMs,
     warning:
       days === requested
@@ -802,11 +816,17 @@ async function emailsPresentIn(table, emailsLc, refine) {
 }
 
 /**
- * Emails we must not mail, unioned from four sources:
+ * Emails we must not mail, unioned from three sources:
  *   a) profiles          — they already have an account (case-insensitive)
  *   b) marketing_suppressions — unsubscribed / bounced / complained
  *   c) pending_subscriptions  — recent *paid* checkout, by session or email
- *   d) free_apply_grants      — already granted a free apply
+ *
+ * free_apply_grants was a fourth source until 2026-08-21 and is deliberately
+ * gone. Claiming the free apply happens on /your-match — the destination of
+ * Email 1's own CTA — so excluding grant holders meant that clicking the first
+ * email ended the sequence. That silently dropped the warmest cohort in the
+ * audience (engaged, claimed, did not convert) while the later emails went
+ * only to leads who had ignored us entirely. Owner decision: they stay in.
  */
 async function findExclusions(candidates) {
   const supabase = getSupabase();
@@ -848,18 +868,49 @@ async function findExclusions(candidates) {
   const inCheckout = await emailsPresentIn('pending_subscriptions', emailsLc, refineCheckout);
   for (const e of inCheckout) excluded.add(e);
 
-  // Ships with the main-repo migration; until then treat as "no grants yet".
-  const { data: granted, error: grantError } = await supabase
-    .from('free_apply_grants')
-    .select('email_lc')
-    .in('email_lc', emailsLc);
-  if (grantError) {
-    console.warn(`[queries] free_apply_grants unavailable (${grantError.message}) — skipping that exclusion.`);
-  } else {
-    for (const row of granted || []) excluded.add(String(row.email_lc).toLowerCase());
+  return excluded;
+}
+
+/**
+ * Send-time paid re-check for ONE lead. findExclusions builds the cohort when
+ * the run starts; a long run (or a backfill draining a large window) can put
+ * minutes between that query and the actual dispatch, and a lead who paid in
+ * the gap must not receive an abandonment email. Mirrors the paid half of
+ * findExclusions — profiles, then pending_subscriptions by session and by
+ * email — and deliberately not the suppression half, which findExclusions
+ * already covers and which cannot change mid-run in a way that matters.
+ *
+ * Throws rather than returning false on a query error: the caller treats a
+ * failed re-check as "defer this lead", so a Supabase blip skips the send and
+ * the next hourly run retries. Failing closed is right here — nothing is
+ * marked sent, so nobody is lost.
+ */
+async function isStillUnpaid(lead) {
+  const supabase = getSupabase();
+  const emailLc = lead.email_lc;
+
+  const inProfiles = await emailsPresentIn('profiles', [emailLc]);
+  if (inProfiles.size > 0) return false;
+
+  const checkoutSince = new Date(Date.now() - SEVEN_DAYS_MS).toISOString();
+
+  if (lead.session_id) {
+    const { data, error } = await supabase
+      .from('pending_subscriptions')
+      .select('session_id')
+      .in('status', PAID_CHECKOUT_STATUSES)
+      .gt('created_at', checkoutSince)
+      .eq('session_id', lead.session_id)
+      .limit(1);
+    if (error) throw new Error(`pending_subscriptions re-check failed: ${error.message}`);
+    if ((data || []).length > 0) return false;
   }
 
-  return excluded;
+  // Same late-email caveat as findExclusions: Stripe reports the address after
+  // the session, so the session join alone can miss a checkout.
+  const refineCheckout = (q) => q.in('status', PAID_CHECKOUT_STATUSES).gt('created_at', checkoutSince);
+  const inCheckout = await emailsPresentIn('pending_subscriptions', [emailLc], refineCheckout);
+  return inCheckout.size === 0;
 }
 
 /**
@@ -923,8 +974,9 @@ async function fetchSurveyRows(win) {
  * what this function owns is the one drop the caller cannot see, because the
  * exclusion set is discarded here.
  */
-async function findAnonLeads(windowOverride, targetingOverride) {
-  const win = windowOverride || computeWindow(Date.now(), process.env);
+async function findAnonLeads(windowOverride, targetingOverride, stageArg = DEFAULT_STAGE) {
+  const stage = resolveStage(stageArg);
+  const win = windowOverride || computeWindow(Date.now(), process.env, stage);
   if (!windowOverride && win.warning) console.warn(`[queries] ${win.warning}`);
   const targeting = targetingOverride || parseTargetEmails(process.env);
 
@@ -941,7 +993,8 @@ async function findAnonLeads(windowOverride, targetingOverride) {
 
   const candidates = [...byEmail.values()].sort(byCreatedAtDesc);
   console.log(
-    `[queries] mode=${win.mode} window=${win.startIso} → ${win.endIso}: ` +
+    `[queries] stage=${stage.id} (${stage.label}) mode=${win.mode} ` +
+      `window=${win.startIso} → ${win.endIso}: ` +
       `${rows.length} opted-in anonymous survey(s) → ${candidates.length} candidate lead(s).`
   );
   if (candidates.length === 0) return [];
@@ -970,8 +1023,8 @@ async function findAnonLeads(windowOverride, targetingOverride) {
       console.warn(
         `[queries] TARGETED MODE: ${excludedTargets.length} target(s) dropped by the exclusion ` +
           `set — ${excludedTargets.join(', ')}. That means they already have a profile, are in ` +
-          'marketing_suppressions, have a paid checkout in the last 7 days, or already hold a ' +
-          'free_apply_grants row. This is a rail, not a bug: it fires in targeted mode too.'
+          'marketing_suppressions, or have a paid checkout in the last 7 days. This is a rail, ' +
+          'not a bug: it fires in targeted mode too.'
       );
     }
   }
@@ -1196,9 +1249,12 @@ module.exports = {
   findExclusions,
   MATCH_CONCURRENCY,
   RUN_BUDGET_MS,
+  isStillUnpaid,
+  EMAIL_STAGES_ORDER: STAGE_ORDER,
   _internals: {
     parseResume,
     leadFromSurvey,
+    NORMAL_SPAN_MS,
     isUsBasedLead,
     NON_US_PHONE_PREFIXES,
     INTL_LOCATION_MARKERS,
