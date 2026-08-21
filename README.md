@@ -271,9 +271,10 @@ These configure `abandonment-anon-lead-email/`, the only worker that still runs.
 | `SUPABASE_URL`                | Supabase project URL                                          |
 | `SUPABASE_SERVICE_KEY`        | Service role key (read access is all that's needed)           |
 | `BREVO_API_KEY`               | Brevo API key                                                 |
-| `BREVO_TEMPLATE_ID_ANON_LEAD` | Brevo template for the **1h** email (stage `first`)           |
-| `BREVO_TEMPLATE_ID_ANON_LEAD_24H` | Brevo template for the **24h** email (stage `day1`)       |
-| `BREVO_TEMPLATE_ID_ANON_LEAD_48H` | Brevo template for the **48h** email (stage `day2`)       |
+| `BREVO_TEMPLATE_ID_ANON_LEAD` | Brevo template for the **1h** email (stage `first`) — live, id **39** |
+| `BREVO_TEMPLATE_ID_ANON_LEAD_24H` | Brevo template for the **24h** email (stage `day1`) — id **43** |
+| `BREVO_TEMPLATE_ID_ANON_LEAD_48H` | Brevo template for the **48h** email (stage `day2`) — id **44** |
+| `TAILORING_ENDPOINT_URL` / `_SECRET` | The 48h email's tailored bullets. **Required** for a real `day2` run; a dry run warns and continues. |
 | `EMAIL_STAGE`                 | Which email this invocation sends: `first` (default), `day1`, `day2`. One cron entry per stage. An unknown value fails the run rather than guessing. |
 | `KV_ENV_PREFIX`               | Namespaces the KV keyspace. **Leave unset in production. Set it in staging** — see below. |
 | `ANTHROPIC_API_KEY`           | Anthropic key for match-pitch generation                      |
@@ -281,6 +282,37 @@ These configure `abandonment-anon-lead-email/`, the only worker that still runs.
 | `EMAIL_LINK_SECRET`           | HMAC secret for the lead token — must match the main app's    |
 | `KV_REST_API_URL` / `_TOKEN`  | Vercel KV send-once dedup. **Required on Vercel** (fail-closed)|
 | `DRY_RUN`                     | `true` (default) logs only; `false` sends live emails. Scoped to this worker alone — the retired workers read their own copies of it and no longer run. |
+
+### Brevo templates
+
+| Stage | Template | Subject |
+| --- | --- | --- |
+| `first` | **39** (live, do not touch) | 🔥 `{{FIRST_NAME}}`, this one's for you — … |
+| `day1` | **43** | Hey `{{FIRST_NAME}}`, `{{COMPANY_NAME}}` is looking for someone like you |
+| `day2` | **44** | `{{FIRST_NAME}}`, your application to `{{COMPANY_NAME}}` is already written |
+
+43 and 44 are built from 39's own stylesheet so the sequence reads as one
+system. Every `{{ params.X }}` in them is a param `buildPayload` actually
+sends — a token the worker does not send renders empty, silently, which is how
+a half-rendered email ships.
+
+Two things in 43/44 deliberately DIVERGE from 39, and 39 should be brought in
+line separately:
+
+- **The privacy link.** 39 points at `standout.jobs/privacy`, which no longer
+  resolves — a dead link in a live email. 43/44 use
+  `www.usestandout.today/privacy`.
+- **The consent line.** 39 says "you created a Standout account". These leads
+  have no account; they uploaded a resume. 43/44 say so.
+
+Both use `{{ unsubscribe }}`, Brevo's own token, rather than a param — an
+unsubscribe URL passed as a param is only as reliable as the sender
+remembering to pass it.
+
+**Template 40** ("Abandonment Email 2 (24hr Nurture)", inactive) predates this
+work and is NOT wired up. It expects `MATCH_COUNT`, `TIME_SINCE_SIGNUP` and
+`UNSUBSCRIBE_URL` — none of which this worker sends, so its unsubscribe link
+would render empty. Use 43.
 
 ### The sequence, and running it in staging
 
