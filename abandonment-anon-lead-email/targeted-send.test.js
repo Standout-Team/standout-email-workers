@@ -231,6 +231,11 @@ queries.findAnonLeads = async (_win, targeting) => {
   return stubs.cohort;
 };
 // findFeaturedJobs returns { matched, ...counters } — see match-fanout.test.js.
+// Stub the pre-send paid re-check (added with the staged sequence). These
+// drives inject their own client and set no Supabase env, so the real
+// implementation's getSupabase() would throw and defer every lead — the
+// same seam findAnonLeads and findFeaturedJobs are patched through above.
+queries.isStillUnpaid = async () => true;
 queries.findFeaturedJobs = async (leads) => ({
   matched: leads.map((l) => ({ lead: l, job: JOB, pct: 88 })),
   noFreshMatch: 0,

@@ -343,6 +343,11 @@ const JOB = { ...jobFor(1), first_seen_at: new Date().toISOString(), salary_min:
 const drive = { cohort: [], client: null, options: null, calls: 0 };
 
 queries.findAnonLeads = async () => drive.cohort;
+// Stub the pre-send paid re-check (added with the staged sequence). These
+// drives inject their own client and set no Supabase env, so the real
+// implementation's getSupabase() would throw and defer every lead — the
+// same seam findAnonLeads and findFeaturedJobs are patched through above.
+queries.isStillUnpaid = async () => true;
 queries.findFeaturedJobs = async (leads, options) => {
   drive.calls++;
   drive.options = options;
