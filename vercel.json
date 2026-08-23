@@ -3,6 +3,12 @@
     "api/abandonment-anon-lead-email.js": {
       "maxDuration": 300
     },
+    "api/abandonment-anon-lead-email-24h.js": {
+      "maxDuration": 300
+    },
+    "api/abandonment-anon-lead-email-48h.js": {
+      "maxDuration": 300
+    },
     "api/post-apply-followup-email.js": {
       "maxDuration": 300
     }
@@ -13,8 +19,16 @@
       "schedule": "0 * * * *"
     },
     {
+      "path": "/api/abandonment-anon-lead-email-24h",
+      "schedule": "20 * * * *"
+    },
+    {
+      "path": "/api/abandonment-anon-lead-email-48h",
+      "schedule": "40 * * * *"
+    },
+    {
       "path": "/api/post-apply-followup-email",
-      "schedule": "0 * * * *"
+      "schedule": "50 * * * *"
     }
   ]
 }

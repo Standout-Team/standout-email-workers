@@ -13,11 +13,14 @@ const {
   filterToTargets,
   findAnonLeads,
   findFeaturedJobs,
+  isStillUnpaid,
 } = require('./queries');
 const { generateMatchReasons } = require('./match-reason');
 const { sendJobEmail } = require('./brevo');
 const { signLeadToken, decodeLeadToken } = require('./lead-token');
 const sentTracker = require('./sent-tracker');
+const { resolveStage, resolveTemplateId, STAGE_ORDER, capForStage } = require('./stages');
+const { fetchTailoredBullets, tailoringConfigured } = require('./tailoring');
 
 // ---------------------------------------------------------------------------
 // Anonymous-lead re-engagement.
@@ -105,7 +108,7 @@ function buildLinks(lead, job) {
   return { token, jobUrl, matchesUrl };
 }
 
-function buildPayload(lead, job, pct, reasons, links) {
+function buildPayload(lead, job, pct, reasons, links, stage, bullets) {
   const firstName = firstNameFor(lead.name);
 
   const params = {
@@ -125,8 +128,21 @@ function buildPayload(lead, job, pct, reasons, links) {
   const salary = formatSalary(job.salary_min, job.salary_max);
   if (salary) params.SALARY_RANGE = salary;
 
+  // Tailored bullets, for the stage whose email is built from them. Sent as
+  // both a list and numbered scalars: Brevo templates handle {{params.X}}
+  // reliably, while iterating a list is fiddlier. Absent keys simply render
+  // empty, so a two-bullet result leaves BULLET_3 blank rather than breaking.
+  if (Array.isArray(bullets) && bullets.length) {
+    params.TAILORED_BULLETS = bullets;
+    bullets.forEach((b, i) => { params[`BULLET_${i + 1}`] = b; });
+    params.BULLET_COUNT = bullets.length;
+  }
+
   return {
-    templateId: process.env.BREVO_TEMPLATE_ID_ANON_LEAD,
+    // Per stage, not per worker: each email in the sequence has its own Brevo
+    // template. run() has already refused to start if this is unset, so the
+    // null case cannot reach a send.
+    templateId: resolveTemplateId(stage, process.env),
     to: [{ email: lead.email, name: firstName }],
     params,
   };
@@ -146,7 +162,7 @@ function buildPayload(lead, job, pct, reasons, links) {
  * most likely outcome of a support resend request — so a targeted run has to be
  * able to say which target it was.
  */
-async function partitionBySentTracker(leads) {
+async function partitionBySentTracker(leads, stage) {
   const unsent = [];
   const alreadySentEmails = [];
   let alreadySent = 0;
@@ -157,7 +173,7 @@ async function partitionBySentTracker(leads) {
     const states = await Promise.all(
       chunk.map(async (lead) => {
         try {
-          return (await sentTracker.hasBeenSent(lead.email_lc)) ? 'sent' : 'unsent';
+          return (await sentTracker.hasBeenSent(lead.email_lc, stage)) ? 'sent' : 'unsent';
         } catch (err) {
           console.error(
             `[abandonment-anon-lead-email] sent-tracker lookup failed for ${lead.email_lc}, deferring:`,
@@ -180,7 +196,7 @@ async function partitionBySentTracker(leads) {
   return { unsent, alreadySent, alreadySentEmails, trackerErrors };
 }
 
-async function run() {
+async function run(options = {}) {
   // The budget clock starts HERE, not at the match stage: what the platform
   // kills at maxDuration is the whole invocation, so every read before the
   // match fan-out — surveys, exclusions, the KV partition — is time the match
@@ -188,7 +204,22 @@ async function run() {
   const runStartMs = Date.now();
   const dryRun = isDryRun();
 
-  const win = computeWindow(runStartMs, process.env);
+  // Which email in the sequence this invocation is sending. One cron entry per
+  // stage, each pinning EMAIL_STAGE; an unset value is the 1h email, so the
+  // existing cron keeps behaving exactly as it did before the sequence existed.
+  // Explicit argument first, EMAIL_STAGE second. The argument is what makes
+  // three hourly crons possible: Vercel cron entries carry only a path and a
+  // schedule — there are NO per-cron environment variables — so three crons
+  // sharing one env var would all run the same stage. Each stage gets its own
+  // thin entrypoint under api/ that names its stage here instead.
+  const stage = resolveStage(options.stage ?? process.env.EMAIL_STAGE);
+  const templateId = resolveTemplateId(stage, process.env);
+  console.log(
+    `[abandonment-anon-lead-email] Stage ${stage.id} (${stage.label}) — ` +
+      `Brevo template ${templateId ?? '(unset)'}.`
+  );
+
+  const win = computeWindow(runStartMs, process.env, stage);
   if (win.warning) console.warn(`[abandonment-anon-lead-email] ${win.warning}`);
   const { cap: requestedCap, warning: capWarning } = resolveSendCap(process.env, win.mode);
   if (capWarning) console.warn(`[abandonment-anon-lead-email] ${capWarning}`);
@@ -256,7 +287,46 @@ async function run() {
     throw new Error(`Refusing to send with non-durable dedup: ${dedup.reason}`);
   }
 
-  const cap = capForDedupAction(requestedCap, dedup.action);
+  // Checked after the dedup guard on purpose: that rail protects the list from
+  // being re-mailed and stays the first thing to trip. This one only protects
+  // the run from a deploy mistake. A dry run needs no template, so it warns
+  // instead — that is how you rehearse a new stage before its template exists.
+  if (!templateId) {
+    const detail =
+      `Stage "${stage.id}" (${stage.label}) has no Brevo template — set ${stage.templateEnv}. ` +
+      `Known stages: ${STAGE_ORDER.join(', ')}.`;
+    if (!dryRun) {
+      // Refuse the whole run rather than let Brevo reject each send one at a
+      // time: a cohort of individual failures buries the real cause. Nothing is
+      // marked sent, so the next run recovers once the env var lands.
+      throw new Error(detail);
+    }
+    console.warn(`[abandonment-anon-lead-email] ${detail} Dry run continues.`);
+  }
+
+  // Same shape as the template guard, and for the same reason: a stage whose
+  // email is BUILT from tailored bullets cannot send a single one without the
+  // endpoint that produces them, so discovering that per-lead would bury the
+  // cause under a cohort of identical deferrals.
+  if (stage.requiresTailoring && !tailoringConfigured(process.env)) {
+    const detail =
+      `Stage "${stage.id}" (${stage.label}) is built from tailored bullets and needs ` +
+      'TAILORING_ENDPOINT_URL and TAILORING_ENDPOINT_SECRET.';
+    if (!dryRun) throw new Error(detail);
+    console.warn(`[abandonment-anon-lead-email] ${detail} Dry run continues without bullets.`);
+  }
+
+  // Two ceilings, both of which can only tighten: the dedup guard's, and the
+  // stage's own. The 48h email pays for an LLM call per recipient, so it cannot
+  // work the whole cohort the way a template-only email can.
+  const dedupCap = capForDedupAction(requestedCap, dedup.action);
+  const cap = capForStage(dedupCap, stage);
+  if (cap !== dedupCap) {
+    console.log(
+      `[abandonment-anon-lead-email] Stage ${stage.id} caps this run at ${cap} ` +
+        `(was ${dedupCap === null ? 'uncapped' : dedupCap}). Leads past the cap are left for later runs.`
+    );
+  }
   const capLabel = cap === null ? 'none' : String(cap);
 
   if (dedup.action === 'warn') {
@@ -305,7 +375,7 @@ async function run() {
 
   let eligible;
   try {
-    eligible = await findAnonLeads(win, targeting);
+    eligible = await findAnonLeads(win, targeting, stage);
   } catch (err) {
     console.error('[abandonment-anon-lead-email] Supabase query failed, aborting run:', err.message);
     throw err;
@@ -351,7 +421,7 @@ async function run() {
     return summary;
   }
 
-  const { unsent, alreadySent, alreadySentEmails, trackerErrors } = await partitionBySentTracker(eligible);
+  const { unsent, alreadySent, alreadySentEmails, trackerErrors } = await partitionBySentTracker(eligible, stage);
 
   // Under KV the sent-tracker drops a lead without a word. In targeted mode
   // every lead here IS a target, so a hit is the answer to "why did my resend
@@ -410,6 +480,7 @@ async function run() {
   }
 
   let sentCount = 0;
+  let tailoringDeferred = 0;
   // leads with a failed tracker lookup + leads with no fresh match (leads the
   // budget deferred are neither — they are still pending)
   let skipped = trackerErrors + (selected.length - sendable.length - deferredByBudget);
@@ -427,7 +498,20 @@ async function run() {
       }
 
       const reasons = await generateMatchReasons(lead.resume_parsed, job);
-      const payload = buildPayload(lead, job, pct, reasons, links);
+
+      // Skip-and-retry, not degrade (owner decision 2026-08-21). Nothing is
+      // marked, so the next hourly run re-offers this lead — which only works
+      // because this stage's window spans three hours. See stages.js.
+      let bullets = null;
+      if (stage.requiresTailoring) {
+        bullets = await fetchTailoredBullets(lead, job, process.env);
+        if (!bullets && !dryRun) {
+          tailoringDeferred++;
+          continue;
+        }
+      }
+
+      const payload = buildPayload(lead, job, pct, reasons, links, stage, bullets);
 
       if (dryRun) {
         console.log(
@@ -441,18 +525,42 @@ async function run() {
         continue;
       }
 
-      // One send per lead email, ever. partitionBySentTracker already dropped
-      // the known-sent; this re-check closes the window between that partition
-      // and this send (overlapping cron runs, a long backfill invocation).
-      const alreadyMailed = await sentTracker.hasBeenSent(lead.email_lc);
+      // One send per lead email per stage, ever. partitionBySentTracker
+      // already dropped the known-sent; this re-check closes the window between
+      // that partition and this send (overlapping cron runs, a long backfill).
+      const alreadyMailed = await sentTracker.hasBeenSent(lead.email_lc, stage);
       if (alreadyMailed) {
         console.log(`[abandonment-anon-lead-email] Already sent to ${lead.email_lc}, skipping.`);
         skipped++;
         continue;
       }
 
+      // The cohort's exclusions were resolved when the run began. A lead who
+      // paid since then must not get an abandonment email, and across a 24h or
+      // 48h stage that gap is the whole point — so re-ask right before we send.
+      // A failed check defers rather than sends: nothing is marked, so the next
+      // hourly run picks them up again.
+      let stillUnpaid;
+      try {
+        stillUnpaid = await isStillUnpaid(lead);
+      } catch (err) {
+        console.warn(
+          `[abandonment-anon-lead-email] paid re-check failed for ${lead.email_lc}, deferring:`,
+          err.message
+        );
+        skipped++;
+        continue;
+      }
+      if (!stillUnpaid) {
+        console.log(
+          `[abandonment-anon-lead-email] ${lead.email_lc} converted since the cohort was built, skipping.`
+        );
+        skipped++;
+        continue;
+      }
+
       const messageId = await sendJobEmail(payload);
-      await sentTracker.markSent(lead.email_lc, job.id);
+      await sentTracker.markSent(lead.email_lc, job.id, stage);
       sentCount++;
       console.log(
         `[abandonment-anon-lead-email] Sent to ${lead.email_lc} (messageId=${messageId}, jobId=${job.id})`
@@ -468,12 +576,19 @@ async function run() {
   // Budget-deferred leads are pending, so they belong with the cap-deferred in
   // "left for later runs" rather than in `skipped`.
   const budgetNote = deferredByBudget > 0 ? ` (+${deferredByBudget} deferred by the run budget)` : '';
+  // Tailoring deferrals are pending too — unmarked, so the next run re-offers
+  // them. Surfaced in the summary rather than left to a grep: a stage quietly
+  // deferring its whole cohort every hour is exactly the kind of failure that
+  // otherwise looks like "no eligible leads".
+  const tailoringNote =
+    tailoringDeferred > 0 ? ` (+${tailoringDeferred} deferred, tailoring unavailable)` : '';
+  summary.tailoringDeferred = tailoringDeferred;
 
   if (dryRun) {
     console.log(
       `[DRY RUN COMPLETE] Would send ${sentCount} of ${unsent.length} eligible — ` +
         `cap=${capLabel}; ${eligible.length} in window after exclusions, ${alreadySent} already sent, ` +
-        `${deferred} left for later runs${budgetNote}, ${skipped} skipped.`
+        `${deferred} left for later runs${budgetNote}${tailoringNote}, ${skipped} skipped.`
     );
   } else {
     // `remaining` is the number the operator watches to decide when to unset
@@ -482,27 +597,45 @@ async function run() {
     console.log(
       `[abandonment-anon-lead-email] Run complete — mode=${win.mode}, sent ${sentCount}, ` +
         `skipped ${skipped}, ${Math.max(0, unsent.length - sentCount)} remaining after this ` +
-        `run${budgetNote}.`
+        `run${budgetNote}${tailoringNote}.`
     );
   }
 
   return summary;
 }
 
-// Vercel serverless handler — mounted at /api/abandonment-anon-lead-email
-async function handler(req, res) {
-  try {
-    const result = await run();
-    res.status(200).json({ ok: true, ...result });
-  } catch (err) {
-    console.error('[abandonment-anon-lead-email] Handler error:', err.message);
-    res.status(500).json({ ok: false, error: err.message });
-  }
+/**
+ * Builds the Vercel serverless handler for one stage.
+ *
+ * Stage resolution, in order: the stage this handler was built for, then
+ * ?stage= on the request, then EMAIL_STAGE. The query param exists for manual
+ * invocation — Vercel only fires crons on production deployments, so a staging
+ * run is someone POSTing this endpoint by hand and it needs to be able to pick
+ * a stage without a redeploy. An unknown value throws rather than falling back
+ * to the 1h email, which would mail the wrong copy on the wrong schedule.
+ */
+function createHandler(stageId) {
+  return async function handler(req, res) {
+    const requested =
+      stageId ??
+      (req && req.query && typeof req.query.stage === 'string' ? req.query.stage : undefined);
+    try {
+      const result = await run({ stage: requested });
+      res.status(200).json({ ok: true, ...result });
+    } catch (err) {
+      console.error('[abandonment-anon-lead-email] Handler error:', err.message);
+      res.status(500).json({ ok: false, error: err.message });
+    }
+  };
 }
+
+// Default export stays the 1h email so the existing cron path is unchanged.
+const handler = createHandler(null);
 
 module.exports = handler;
 module.exports.run = run;
 module.exports.handler = handler;
+module.exports.createHandler = createHandler;
 module.exports._internals = { formatSalary, formatJobAge, firstNameFor, buildLinks, buildPayload };
 
 // Run directly via `node index.js`
