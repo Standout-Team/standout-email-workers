@@ -17,6 +17,18 @@ const TEMPLATE_ID = 42;
 const KV_PREFIX = 'post_apply_followup_sent:';
 const KV_TTL_SECONDS = 30 * 24 * 60 * 60; // 30 days
 const ONE_HOUR_MS = 60 * 60 * 1000;
+// Hard ceiling on real sends per run. The 24-25h window is one hour wide and
+// the cron is hourly, so a healthy run is small — but a clock skew, a backfill
+// or a widened window would otherwise mail the whole cohort at once. Mirrors
+// SEND_CAP in abandonment-anon-lead-email/queries.js.
+const DEFAULT_SEND_CAP = 200;
+// Tighter ceiling when the KV dedup is unavailable, because hasBeenSent() then
+// answers "not sent" for everyone and a re-run would mail the cohort twice.
+// Same rail as NON_DURABLE_SEND_CAP in the sibling worker.
+const NON_DURABLE_SEND_CAP = 50;
+// PostgREST hands the pattern straight to ilike, so a stray % or _ inside an
+// address would widen the match.
+const ILIKE_CHUNK = 25;
 const WINDOW_START_MS = 25 * ONE_HOUR_MS; // redeemed 25h+ ago
 const WINDOW_END_MS   = 24 * ONE_HOUR_MS; // redeemed up to 24h ago
 
@@ -70,16 +82,23 @@ function firstNameFor(name) {
   return trimmed.split(/\s+/)[0];
 }
 
+// Title-case ONLY a word that is entirely lowercase. Lowercasing first turned
+// "IBM" into "Ibm" and "eBay" into "Ebay" in a customer-facing email; a company
+// that already carries capitals has spelled itself the way it wants.
 function capitalize(str) {
   if (!str) return str;
-  return str
-    .toLowerCase()
+  return String(str)
     .split(' ')
-    .map(w => w.charAt(0).toUpperCase() + w.slice(1))
+    .map(w => (w && w === w.toLowerCase() ? w.charAt(0).toUpperCase() + w.slice(1) : w))
     .join(' ');
 }
 
 function formatSalary(min, max) {
+  // Reject null/undefined/'' BEFORE coercing: Number(null) and Number('') are
+  // both 0, which is finite — so a job with no salary_min rendered "$0k–$120k"
+  // into a customer-facing email rather than omitting the range.
+  const usable = (v) => v !== null && v !== undefined && String(v).trim() !== '';
+  if (!usable(min) || !usable(max)) return null;
   const lo = Number(min);
   const hi = Number(max);
   if (!Number.isFinite(lo) || !Number.isFinite(hi)) return null;
@@ -91,6 +110,87 @@ function buildCtaUrl(base) {
   const url = new URL(base);
   Object.entries(UTM).forEach(([k, v]) => url.searchParams.set(k, v));
   return url.toString();
+}
+
+function escapeLike(value) {
+  return String(value).replace(/[\\%_]/g, (c) => `\\${c}`);
+}
+
+/**
+ * Case-insensitive "which of these emails exist in `table`?".
+ *
+ * ILIKE rather than .in(): pending_subscriptions stores 5 addresses that are
+ * not lowercased, and an .in() over lowercased grant emails silently misses
+ * them — the exact shape of a paid buyer getting a "you did not buy" email.
+ * `refine` adds per-table filters (a paid status, an active subscription).
+ */
+async function emailsPresentIn(db, table, emailsLc, refine) {
+  const hits = new Set();
+  for (let i = 0; i < emailsLc.length; i += ILIKE_CHUNK) {
+    const chunk = emailsLc.slice(i, i + ILIKE_CHUNK);
+    let q = db.from(table).select('email').or(
+      chunk.map((e) => `email.ilike.${escapeLike(e)}`).join(',')
+    );
+    if (refine) q = refine(q);
+    const { data, error } = await q;
+    if (error) throw new Error(`${table} lookup failed: ${error.message}`);
+    for (const row of data || []) {
+      const e = String(row.email || '').toLowerCase();
+      if (e) hits.add(e);
+    }
+  }
+  return hits;
+}
+
+/**
+ * Everyone who must NOT get this email, by address:
+ *
+ *   a) profiles with an ACTIVE subscription — they bought. Presence alone is
+ *      not disqualifying the way it is in the abandonment worker: a free-apply
+ *      grantee has an anonymous account by construction, so excluding every
+ *      profile would empty the audience.
+ *   b) marketing_suppressions — unsubscribed / bounced / complained. Brevo
+ *      blocks its own list at send time anyway, so skipping here saves a wasted
+ *      send and keeps our database agreeing with theirs (see Standout-pro #407).
+ *   c) pending_subscriptions with a paid guest checkout — the pre-account path.
+ *
+ * (a) and (c) are BOTH needed: a guest checkout lands in pending_subscriptions,
+ * an authed purchase never does. Checking only (c) excluded nobody at all.
+ */
+async function findExclusions(db, emailsLc) {
+  const excluded = new Set();
+
+  const subscribed = await emailsPresentIn(db, 'profiles', emailsLc, (q) =>
+    q.in('subscription_status', ['active', 'trialing'])
+  );
+  for (const e of subscribed) excluded.add(e);
+
+  const suppressed = await emailsPresentIn(db, 'marketing_suppressions', emailsLc);
+  for (const e of suppressed) excluded.add(e);
+
+  const paid = await emailsPresentIn(db, 'pending_subscriptions', emailsLc, (q) =>
+    q.eq('status', 'paid')
+  );
+  for (const e of paid) excluded.add(e);
+
+  return excluded;
+}
+
+/**
+ * The per-run ceiling. An explicit SEND_CAP wins; otherwise DEFAULT_SEND_CAP.
+ * A non-durable dedup store narrows whatever that is to NON_DURABLE_SEND_CAP —
+ * it can only ever reduce, never raise an operator's own cap.
+ */
+function resolveSendCap(env, kvDurable) {
+  const raw = env.SEND_CAP;
+  const text = typeof raw === 'string' ? raw.trim() : '';
+  let cap = DEFAULT_SEND_CAP;
+  if (text) {
+    const n = Number(text);
+    if (Number.isInteger(n) && n > 0) cap = n;
+    else console.warn(`[post-apply-followup] SEND_CAP="${text}" is not a positive integer — using ${cap}.`);
+  }
+  return kvDurable ? cap : Math.min(cap, NON_DURABLE_SEND_CAP);
 }
 
 async function findEligible(db) {
@@ -113,18 +213,15 @@ async function findEligible(db) {
   const real = grants.filter(g => !g.email_lc.includes('calcal123235'));
   if (real.length === 0) return [];
 
-  // Check which emails have already paid
-  const emails = real.map(g => g.email_lc);
-  const { data: paid, error: pErr } = await db
-    .from('pending_subscriptions')
-    .select('email')
-    .in('email', emails)
-    .eq('status', 'paid');
+  const emails = [...new Set(real.map(g => String(g.email_lc || '').toLowerCase()).filter(Boolean))];
+  const excluded = await findExclusions(db, emails);
+  const kept = real.filter(g => !excluded.has(String(g.email_lc || '').toLowerCase()));
 
-  if (pErr) throw new Error(`Paid subscription query failed: ${pErr.message}`);
-  const paidEmails = new Set((paid || []).map(p => (p.email || '').toLowerCase()));
-
-  return real.filter(g => !paidEmails.has(g.email_lc));
+  console.log(
+    `[post-apply-followup] ${real.length} in window → ${excluded.size} excluded ` +
+      `(subscribed / suppressed / paid) → ${kept.length} eligible.`
+  );
+  return kept;
 }
 
 async function enrichGrant(db, grant) {
@@ -195,8 +292,17 @@ async function run() {
   const db = getSupabase();
   const brevoApi = getBrevoApi();
 
-  const eligible = await findEligible(db);
-  console.log(`[post-apply-followup] Eligible (unpaid, redeemed 24-25h ago): ${eligible.length}`);
+  const allEligible = await findEligible(db);
+  const cap = resolveSendCap(process.env, isKVAvailable());
+  const eligible = allEligible.slice(0, cap);
+  if (allEligible.length > eligible.length) {
+    console.warn(
+      `[post-apply-followup] Capped at ${cap} of ${allEligible.length} eligible — ` +
+        `${allEligible.length - eligible.length} deferred to a later run` +
+        (isKVAvailable() ? '.' : ' (dedup is NON-DURABLE, so the cap is tightened).')
+    );
+  }
+  console.log(`[post-apply-followup] Eligible (unpaid, redeemed 24-25h ago): ${eligible.length} (cap=${cap})`);
 
   let sent = 0, skipped = 0, errors = 0;
 
@@ -246,6 +352,8 @@ async function run() {
   console.log(`[post-apply-followup] Done. sent=${sent} skipped=${skipped} errors=${errors}`);
 }
 
+// Exported for tests. The handler stays the default export so the Vercel
+// entry point (`api/post-apply-followup-email.js`) is unchanged.
 module.exports = async function handler(req, res) {
   try {
     await run();
@@ -259,3 +367,14 @@ module.exports = async function handler(req, res) {
 if (require.main === module) {
   run().then(() => process.exit(0)).catch(err => { console.error(err); process.exit(1); });
 }
+
+module.exports._internals = {
+  capitalize,
+  formatSalary,
+  firstNameFor,
+  buildCtaUrl,
+  escapeLike,
+  resolveSendCap,
+  DEFAULT_SEND_CAP,
+  NON_DURABLE_SEND_CAP,
+};

@@ -5,7 +5,8 @@
   "main": "index.js",
   "scripts": {
     "start": "node index.js",
-    "dry-run": "DRY_RUN=true node index.js"
+    "dry-run": "DRY_RUN=true node index.js",
+    "test": "node --test"
   },
   "dependencies": {
     "@getbrevo/brevo": "*",
