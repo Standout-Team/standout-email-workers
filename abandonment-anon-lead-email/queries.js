@@ -12,6 +12,11 @@ const SEVEN_DAYS_MS = 7 * 24 * 60 * 60 * 1000;
 const PAID_CHECKOUT_STATUSES = ['paid'];
 // Per-email ilike counts are one request each; keep the fan-out polite.
 const ILIKE_CHUNK = 10;
+// Addresses per `in.()` on the redeemed-grant lookup. Unlike ILIKE_CHUNK this
+// bounds URL LENGTH rather than request concurrency — one request carries the
+// whole chunk — so it is much larger. ~100 addresses is a few KB url-encoded,
+// comfortably inside the request-line limits between us and PostgREST.
+const GRANT_IN_CHUNK = 100;
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 
 // --- Window / backfill configuration -------------------------------------
@@ -913,13 +918,26 @@ async function findExclusions(candidates, stageArg = DEFAULT_STAGE, options = {}
   // exists, so a query error here is a real failure, and soft-failing would
   // quietly send the duplicate 24h email this rail exists to prevent.
   if (stageExcludesRedeemedGrants(stage) && emailsLc.length > 0) {
-    const { data: redeemed, error: grantError } = await supabase
-      .from('free_apply_grants')
-      .select('email_lc')
-      .not('redeemed_at', 'is', null)
-      .in('email_lc', emailsLc);
-    if (grantError) throw new Error(`free_apply_grants query failed: ${grantError.message}`);
-    for (const row of redeemed || []) excluded.add(String(row.email_lc).toLowerCase());
+    // Chunked, because a PostgREST `in.()` travels in the URL. A normal run
+    // carries ~10 addresses and would fit in one request, but BACKFILL_DAYS is
+    // a supported operator mode and the cohort is bounded by
+    // SURVEY_PAGE_SIZE * MAX_SURVEY_PAGES = 25,000 — a 30-day backfill is
+    // ~3,900 today. One request carrying 3,900 comma-separated, url-encoded
+    // addresses is a ~100KB request line: it does not merely degrade, it fails,
+    // and because the error below throws (deliberately) it would abort the
+    // whole day1 backfill. GRANT_IN_CHUNK, not ILIKE_CHUNK: that one is sized
+    // for a fan-out of one request PER EMAIL, while this is one request per
+    // chunk, so a tighter value would only add round trips.
+    for (let i = 0; i < emailsLc.length; i += GRANT_IN_CHUNK) {
+      const chunk = emailsLc.slice(i, i + GRANT_IN_CHUNK);
+      const { data: redeemed, error: grantError } = await supabase
+        .from('free_apply_grants')
+        .select('email_lc')
+        .not('redeemed_at', 'is', null)
+        .in('email_lc', chunk);
+      if (grantError) throw new Error(`free_apply_grants query failed: ${grantError.message}`);
+      for (const row of redeemed || []) excluded.add(String(row.email_lc).toLowerCase());
+    }
   }
 
   return excluded;

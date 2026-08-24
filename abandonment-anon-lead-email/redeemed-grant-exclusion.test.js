@@ -200,3 +200,65 @@ test('findExclusions: day1 unions the grant source with the existing ones', asyn
   const excluded = await findExclusions(cohort, 'day1', { client });
   assert.deepEqual([...excluded].sort(), [APPLIER, suppressed].sort());
 });
+
+// --- chunking: the backfill-sized cohort -------------------------------------
+//
+// A PostgREST `in.()` travels in the URL. A normal day1 run carries ~10
+// addresses, but BACKFILL_DAYS is a supported operator mode and the cohort is
+// bounded by SURVEY_PAGE_SIZE * MAX_SURVEY_PAGES = 25,000 (a 30-day backfill is
+// ~3,900 today). Unchunked, that is a ~100KB request line — and because the
+// grant query throws on error, the failure would abort the entire backfill run
+// rather than degrade.
+
+const bigCohort = (n) => Array.from({ length: n }, (_, i) => lead(`lead${i}@example.com`));
+
+test('findExclusions: a backfill-sized cohort is split across several grant queries', async () => {
+  const client = stubClient(() => ({}));
+  await findExclusions(bigCohort(250), 'day1', { client });
+
+  const grants = grantQueries(client);
+  assert.ok(grants.length > 1, 'a 250-address cohort must not travel in one URL');
+
+  for (const q of grants) {
+    const inFilter = q.filters.find((f) => f.op === 'in');
+    assert.ok(inFilter, 'every grant query still filters by email_lc');
+    assert.equal(inFilter.col, 'email_lc');
+    assert.ok(
+      inFilter.val.length <= 100,
+      `chunk of ${inFilter.val.length} exceeds the URL-length budget`
+    );
+  }
+});
+
+test('findExclusions: chunking covers every address exactly once', async () => {
+  const client = stubClient(() => ({}));
+  const cohort = bigCohort(250);
+  await findExclusions(cohort, 'day1', { client });
+
+  const seen = grantQueries(client).flatMap((q) => q.filters.find((f) => f.op === 'in').val);
+  assert.deepEqual(seen.slice().sort(), cohort.map((l) => l.email_lc).sort());
+  assert.equal(new Set(seen).size, seen.length, 'no address is queried twice');
+});
+
+test('findExclusions: a hit in ANY chunk still excludes — results union across chunks', async () => {
+  // The redeemed lead sits in the last chunk, so a bug that kept only the first
+  // chunk's rows would let them through and send the duplicate 24h email.
+  const cohort = bigCohort(250);
+  const lateApplier = cohort[cohort.length - 1].email_lc;
+  const client = stubClient((q) =>
+    q.table === 'free_apply_grants' &&
+    q.filters.find((f) => f.op === 'in').val.includes(lateApplier)
+      ? { data: [{ email_lc: lateApplier }] }
+      : {}
+  );
+
+  const excluded = await findExclusions(cohort, 'day1', { client });
+  assert.equal(excluded.has(lateApplier), true);
+  assert.equal(excluded.size, 1, 'and nobody else');
+});
+
+test('findExclusions: a small cohort still takes exactly one grant query', async () => {
+  const client = stubClient(grantRespond);
+  await findExclusions(COHORT, 'day1', { client });
+  assert.equal(grantQueries(client).length, 1, 'chunking must not add round trips to a normal run');
+});
