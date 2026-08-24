@@ -19,11 +19,27 @@ account to magic-link them into, so every CTA carries a signed 14-day lead token
 
 Audience: `surveys` with `marketing_opt_in`, `user_id IS NULL`, a parsed resume carrying a
 plausible email, created inside the run's window (below). Excludes existing `profiles`,
-`marketing_suppressions`, recent `paid` `pending_subscriptions`, and anyone with a
-`free_apply_grants` row. A `created`-but-unpaid checkout is **not** an exclusion — that
-lead abandoned too, and gets this email like any other abandoner. The featured job comes
-from the production `match_jobs_for_survey` RPC and is dropped if it closed or went stale
-(>3 days).
+`marketing_suppressions`, and recent `paid` `pending_subscriptions`. A `created`-but-unpaid
+checkout is **not** an exclusion — that lead abandoned too, and gets this email like any
+other abandoner. The featured job comes from the production `match_jobs_for_survey` RPC and
+is dropped if it closed or went stale (>3 days).
+
+**Free-apply grants** are a stage-specific exclusion, and only one stage's:
+
+| Grant state | `first` (1h) | `day1` (24h) | `day2` (48h) |
+| --- | --- | --- | --- |
+| No grant | sends | sends | sends |
+| Claimed, `redeemed_at IS NULL` | sends | sends | sends |
+| **Redeemed** (`redeemed_at IS NOT NULL`) | sends | **excluded** | sends |
+
+*Claiming* the free apply happens on `/your-match`, the destination of Email 1's own CTA,
+so it excludes nothing anywhere — clicking Email 1 must not end the sequence (owner
+decision **2026-08-21**, which removed `free_apply_grants` as a blanket exclusion).
+*Redeeming* it means the lead actually applied, and `post-apply-followup-email/` mails them
+**template 42** 24–25h later with a pick-a-plan CTA. Template 43 would land beside it, so
+the redeemed lead's 24h touch belongs to template 42 and `day1` stands down (owner
+decision **2026-08-24**). `day2` is untouched, so an applier who still hasn't purchased
+gets the 48h tailored nudge at its normal time.
 
 Dedup is **Vercel KV** (`anon_lead_sent:<email_lc>`, stored indefinitely — one send per
 lead email, ever), matching `abandonment-job-email/`. Without `KV_REST_API_URL` /
@@ -183,7 +199,7 @@ If nothing sends, the logs name the reason rather than making you guess:
 | Log line | Meaning |
 | --- | --- |
 | `TARGET NOT FOUND: <email>` | Not in the run's candidate set — their survey is outside the window (raise `BACKFILL_DAYS`) or they fail the audience criteria (opt-in, anonymous, parsed resume email). |
-| `TARGETED MODE: N target(s) dropped by the exclusion set` | They have a profile, are suppressed, or have a paid checkout in the last 7 days. Holding a free-apply grant is **no longer** an exclusion (2026-08-21). |
+| `TARGETED MODE: N target(s) dropped by the exclusion set` | They have a profile, are suppressed, or have a paid checkout in the last 7 days — **and, on `day1` only**, they have already *redeemed* a free apply, whose 24h touch belongs to the post-apply follow-up (template 42) instead (2026-08-24). Merely *claiming* a grant is **not** an exclusion at any stage (2026-08-21), and `day2` still sends to appliers. The `day1` log line names the extra reason. |
 | `TARGETED MODE: N target(s) dropped as international` | Their resume phone or location reads as outside the US. Canada counts as eligible. |
 | `<email> converted since the cohort was built` | The send-time paid re-check caught a lead who paid between the cohort query and dispatch. Working as intended. |
 | `TARGETED MODE: N target(s) were already mailed` | The sent-tracker is one-send-per-lead-email **forever**, and targeting does not reset it. |

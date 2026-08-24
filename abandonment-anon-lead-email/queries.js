@@ -12,6 +12,11 @@ const SEVEN_DAYS_MS = 7 * 24 * 60 * 60 * 1000;
 const PAID_CHECKOUT_STATUSES = ['paid'];
 // Per-email ilike counts are one request each; keep the fan-out polite.
 const ILIKE_CHUNK = 10;
+// Addresses per `in.()` on the redeemed-grant lookup. Unlike ILIKE_CHUNK this
+// bounds URL LENGTH rather than request concurrency — one request carries the
+// whole chunk — so it is much larger. ~100 addresses is a few KB url-encoded,
+// comfortably inside the request-line limits between us and PostgREST.
+const GRANT_IN_CHUNK = 100;
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 
 // --- Window / backfill configuration -------------------------------------
@@ -791,10 +796,12 @@ function escapeLike(value) {
 /**
  * Case-insensitive "is this email present?" against a table with an `id` PK.
  * One head+count request per email, fanned out ILIKE_CHUNK at a time.
- * `refine` optionally adds filters to each query.
+ * `refine` optionally adds filters to each query. `client` optionally injects a
+ * Supabase stand-in — the same seam findFeaturedJobs takes, so the exclusion
+ * set can be driven in tests without a database.
  */
-async function emailsPresentIn(table, emailsLc, refine) {
-  const supabase = getSupabase();
+async function emailsPresentIn(table, emailsLc, refine, client = null) {
+  const supabase = client || getSupabase();
   const hits = new Set();
 
   for (let i = 0; i < emailsLc.length; i += ILIKE_CHUNK) {
@@ -818,26 +825,57 @@ async function emailsPresentIn(table, emailsLc, refine) {
 }
 
 /**
- * Emails we must not mail, unioned from three sources:
+ * True when a stage hands its touch to the post-apply follow-up and therefore
+ * must skip leads who have already redeemed their free apply. Pure, and keyed
+ * on the stage id rather than a flag on the stage object because it is a fact
+ * about *this* audience query, not about the sequence's shape.
+ *
+ * Only `day1` is affected — see findExclusions.
+ */
+function stageExcludesRedeemedGrants(stageArg) {
+  return resolveStage(stageArg).id === 'day1';
+}
+
+/**
+ * Emails we must not mail, unioned from three sources — four on stage `day1`:
  *   a) profiles          — they already have an account (case-insensitive)
  *   b) marketing_suppressions — unsubscribed / bounced / complained
  *   c) pending_subscriptions  — recent *paid* checkout, by session or email
+ *   d) free_apply_grants with redeemed_at set — DAY1 ONLY (see below)
  *
- * free_apply_grants was a fourth source until 2026-08-21 and is deliberately
- * gone. Claiming the free apply happens on /your-match — the destination of
- * Email 1's own CTA — so excluding grant holders meant that clicking the first
- * email ended the sequence. That silently dropped the warmest cohort in the
- * audience (engaged, claimed, did not convert) while the later emails went
- * only to leads who had ignored us entirely. Owner decision: they stay in.
+ * free_apply_grants was an unconditional fourth source until 2026-08-21 and is
+ * deliberately gone as such. Claiming the free apply happens on /your-match —
+ * the destination of Email 1's own CTA — so excluding grant holders meant that
+ * clicking the first email ended the sequence. That silently dropped the
+ * warmest cohort in the audience (engaged, claimed, did not convert) while the
+ * later emails went only to leads who had ignored us entirely. Owner decision:
+ * they stay in.
+ *
+ * 2026-08-24 refines that without reversing it. A *redeemed* grant
+ * (`redeemed_at IS NOT NULL`) means the lead actually applied, and the
+ * post-apply follow-up worker mails them Brevo template 42 — a pick-a-plan
+ * CTA — 24–25h after that redemption. Template 43 (this stage `day1`, also at
+ * 24h) would land beside it, so the redeemed lead's 24h touch belongs to
+ * template 42 and this stage stands down. Nothing else changes:
+ *
+ *   - `first` (1h) still sends. Moot in practice — redemption comes after it.
+ *   - `day2` (48h, template 44) still sends, so an applier who has not
+ *     purchased still gets the 48h tailored nudge.
+ *   - A *claimed but unredeemed* grant excludes nothing, anywhere. That is the
+ *     2026-08-21 decision above, untouched.
+ *
+ * `options.client` injects a Supabase stand-in for tests.
  */
-async function findExclusions(candidates) {
-  const supabase = getSupabase();
+async function findExclusions(candidates, stageArg = DEFAULT_STAGE, options = {}) {
+  const { client = null } = options;
+  const stage = resolveStage(stageArg);
+  const supabase = client || getSupabase();
   const emailsLc = candidates.map((l) => l.email_lc);
   const sessionIds = candidates.map((l) => l.session_id).filter(Boolean);
   const emailBySession = new Map(candidates.map((l) => [l.session_id, l.email_lc]));
   const excluded = new Set();
 
-  const inProfiles = await emailsPresentIn('profiles', emailsLc);
+  const inProfiles = await emailsPresentIn('profiles', emailsLc, undefined, client);
   for (const e of inProfiles) excluded.add(e);
 
   // Suppressions are stored lowercase — a plain IN is enough.
@@ -867,8 +905,40 @@ async function findExclusions(candidates) {
 
   // Stripe reports the email late, so the session join above can miss a
   // checkout the lead started from another tab.
-  const inCheckout = await emailsPresentIn('pending_subscriptions', emailsLc, refineCheckout);
+  const inCheckout = await emailsPresentIn(
+    'pending_subscriptions',
+    emailsLc,
+    refineCheckout,
+    client
+  );
   for (const e of inCheckout) excluded.add(e);
+
+  // day1 only. email_lc is already lowercased by the writer, so a plain IN is
+  // enough — no ilike fan-out. Throws like every source above: the table
+  // exists, so a query error here is a real failure, and soft-failing would
+  // quietly send the duplicate 24h email this rail exists to prevent.
+  if (stageExcludesRedeemedGrants(stage) && emailsLc.length > 0) {
+    // Chunked, because a PostgREST `in.()` travels in the URL. A normal run
+    // carries ~10 addresses and would fit in one request, but BACKFILL_DAYS is
+    // a supported operator mode and the cohort is bounded by
+    // SURVEY_PAGE_SIZE * MAX_SURVEY_PAGES = 25,000 — a 30-day backfill is
+    // ~3,900 today. One request carrying 3,900 comma-separated, url-encoded
+    // addresses is a ~100KB request line: it does not merely degrade, it fails,
+    // and because the error below throws (deliberately) it would abort the
+    // whole day1 backfill. GRANT_IN_CHUNK, not ILIKE_CHUNK: that one is sized
+    // for a fan-out of one request PER EMAIL, while this is one request per
+    // chunk, so a tighter value would only add round trips.
+    for (let i = 0; i < emailsLc.length; i += GRANT_IN_CHUNK) {
+      const chunk = emailsLc.slice(i, i + GRANT_IN_CHUNK);
+      const { data: redeemed, error: grantError } = await supabase
+        .from('free_apply_grants')
+        .select('email_lc')
+        .not('redeemed_at', 'is', null)
+        .in('email_lc', chunk);
+      if (grantError) throw new Error(`free_apply_grants query failed: ${grantError.message}`);
+      for (const row of redeemed || []) excluded.add(String(row.email_lc).toLowerCase());
+    }
+  }
 
   return excluded;
 }
@@ -1001,7 +1071,7 @@ async function findAnonLeads(windowOverride, targetingOverride, stageArg = DEFAU
   );
   if (candidates.length === 0) return [];
 
-  const excluded = await findExclusions(candidates);
+  const excluded = await findExclusions(candidates, stage);
   const kept = candidates.filter((lead) => !excluded.has(lead.email_lc));
 
   // Geography gate: the featured job comes from a US ATS board, so an
@@ -1022,10 +1092,24 @@ async function findAnonLeads(windowOverride, targetingOverride, stageArg = DEFAU
   if (targeting.active && excluded.size > 0) {
     const excludedTargets = targeting.targets.filter((t) => excluded.has(t));
     if (excludedTargets.length > 0) {
+      const reasons = [
+        'they already have a profile',
+        'are in marketing_suppressions',
+        'have a paid checkout in the last 7 days',
+      ];
+      // day1 carries a fourth reason, and it is the one a tester is most likely
+      // to trip: redeeming the free apply is exactly what QA does to exercise
+      // the flow. Name it, or the drop reads as a bug.
+      if (stageExcludesRedeemedGrants(stage)) {
+        reasons.push(
+          'have already redeemed their free apply, whose 24h touch belongs to the ' +
+            'post-apply follow-up email (this stage only)'
+        );
+      }
+      const why = `${reasons.slice(0, -1).join(', ')}, or ${reasons[reasons.length - 1]}`;
       console.warn(
         `[queries] TARGETED MODE: ${excludedTargets.length} target(s) dropped by the exclusion ` +
-          `set — ${excludedTargets.join(', ')}. That means they already have a profile, are in ` +
-          'marketing_suppressions, or have a paid checkout in the last 7 days. This is a rail, ' +
+          `set — ${excludedTargets.join(', ')}. That means ${why}. This is a rail, ` +
           'not a bug: it fires in targeted mode too.'
       );
     }
@@ -1249,6 +1333,7 @@ module.exports = {
   findAnonLeads,
   findFeaturedJobs,
   findExclusions,
+  stageExcludesRedeemedGrants,
   MATCH_CONCURRENCY,
   RUN_BUDGET_MS,
   isStillUnpaid,
