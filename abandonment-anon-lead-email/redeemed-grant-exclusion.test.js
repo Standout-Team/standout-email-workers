@@ -7,7 +7,7 @@
  * Two halves, both offline:
  *   1. stageExcludesRedeemedGrants — the pure stage predicate.
  *   2. findExclusions driven against an injected Supabase stand-in, proving
- *      day1 issues the fourth query and `first` / `day2` do not.
+ *      day1 issues the fourth query and `first` / `day2` / `day3` do not.
  *
  *   node --test            (from the repo root or this directory)
  */
@@ -20,10 +20,19 @@ const { EMAIL_STAGES, STAGE_ORDER } = require('./stages');
 
 // --- stageExcludesRedeemedGrants: the pure predicate ------------------------
 
-test('stageExcludesRedeemedGrants: day1 excludes, first and day2 do not', () => {
+test('stageExcludesRedeemedGrants: day1 excludes, the other stages do not', () => {
   assert.equal(stageExcludesRedeemedGrants('first'), false);
   assert.equal(stageExcludesRedeemedGrants('day1'), true);
   assert.equal(stageExcludesRedeemedGrants('day2'), false);
+  assert.equal(stageExcludesRedeemedGrants('day3'), false);
+});
+
+test('stageExcludesRedeemedGrants: the 72h offer email still goes to appliers', () => {
+  // The rail is day1-only and stays that way. A lead who redeemed their free
+  // apply and did not buy is exactly who the 75%-off offer is for, and nothing
+  // else lands beside it at 72h — template 42 owns the 24h touch, not this one.
+  assert.equal(stageExcludesRedeemedGrants('day3'), false);
+  assert.equal(stageExcludesRedeemedGrants(EMAIL_STAGES.day3), false);
 });
 
 test('stageExcludesRedeemedGrants: every stage in the sequence is decided', () => {
@@ -49,7 +58,7 @@ test('stageExcludesRedeemedGrants: an un-passed stage is the launch stage, so no
 });
 
 test('stageExcludesRedeemedGrants: an unknown stage id throws, it does not silently pass', () => {
-  assert.throws(() => stageExcludesRedeemedGrants('day3'), /Unknown email stage/);
+  assert.throws(() => stageExcludesRedeemedGrants('day7'), /Unknown email stage/);
 });
 
 // --- findExclusions, against an injected client ------------------------------
@@ -139,8 +148,8 @@ test('findExclusions: day1 asks free_apply_grants for redeemed rows, by email_lc
   );
 });
 
-test('findExclusions: first and day2 never touch free_apply_grants', async () => {
-  for (const stageId of ['first', 'day2']) {
+test('findExclusions: first, day2 and day3 never touch free_apply_grants', async () => {
+  for (const stageId of ['first', 'day2', 'day3']) {
     const client = stubClient(grantRespond);
     const excluded = await findExclusions(COHORT, stageId, { client });
 

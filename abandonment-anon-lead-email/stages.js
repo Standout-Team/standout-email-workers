@@ -43,8 +43,24 @@
  *               recipient inside a 280s budget, so it cannot use the whole
  *               cohort the way a template-only email can.
  *
- * The 72h discount email is deliberately absent: it is blocked on Stripe
- * coupon infrastructure and ships separately (owner decision 2026-08-21).
+ *   offer       Optional. A discount this stage's email advertises: the
+ *               percentage and the product path that sells it. Present only on
+ *               the stage that carries one, so the sequence stays data-driven —
+ *               buildPayload adds OFFER_PERCENT / OFFER_URL when it is set and
+ *               sends neither param when it is not. See the parity rule below.
+ *
+ * The 72h discount email now ships as stage `day3` (owner decision
+ * 2026-08-27). Its Stripe-coupon blocker is resolved by reusing the product's
+ * existing paid-retargeting offer rather than minting a new one: the email
+ * points at `/comeback`, which is live in Standout-pro along with its coupon
+ * (STRIPE_COUPON_RETARGET_75) and the server-side checkout enforcement.
+ *
+ * PERCENT PARITY IS LOAD-BEARING. `day3.offer.percent` MUST stay equal to
+ * RETARGET_DISCOUNT_PERCENT in Standout-pro's `shared/retarget-offer.ts` (= 75)
+ * and to the Stripe coupon's own percent_off. This email advertises the number,
+ * /comeback renders its prices from it, and Stripe charges it — three copies of
+ * one figure. If they drift the user is shown one number and billed another,
+ * which is the failure mode this codebase treats as unacceptable.
  */
 
 const ONE_HOUR_MS = 60 * 60 * 1000;
@@ -90,10 +106,27 @@ const EMAIL_STAGES = Object.freeze({
     kvKey: 'anon_lead_48h_sent',
     templateEnv: 'BREVO_TEMPLATE_ID_ANON_LEAD_48H',
   }),
+  day3: Object.freeze({
+    id: 'day3',
+    label: '72h',
+    delayMs: 72 * ONE_HOUR_MS,
+    spanMs: RETRY_SPAN_MS,
+    // Template-only, like the 1h and 24h emails: no LLM call per recipient, so
+    // there is nothing here that the whole cohort cannot afford.
+    maxPerRun: null,
+    requiresTailoring: false,
+    kvKey: 'anon_lead_72h_sent',
+    templateEnv: 'BREVO_TEMPLATE_ID_ANON_LEAD_72H',
+    // 75% off the first year, sold by the product's own /comeback page. The
+    // percent must equal RETARGET_DISCOUNT_PERCENT in Standout-pro's
+    // shared/retarget-offer.ts and the Stripe coupon's percent_off — see the
+    // parity note at the top of this file.
+    offer: Object.freeze({ percent: 75, path: '/comeback' }),
+  }),
 });
 
 // Chronological. The order a lead moves through the sequence.
-const STAGE_ORDER = Object.freeze(['first', 'day1', 'day2']);
+const STAGE_ORDER = Object.freeze(['first', 'day1', 'day2', 'day3']);
 
 // Every caller that predates the sequence gets the 1h email, so an un-passed
 // stage argument anywhere behaves exactly as the worker did before.
