@@ -57,7 +57,18 @@ test('each stage owns a distinct KV namespace', () => {
     'anon_lead_sent:lead@example.com',
     'anon_lead_24h_sent:lead@example.com',
     'anon_lead_48h_sent:lead@example.com',
+    'anon_lead_72h_sent:lead@example.com',
   ]);
+});
+
+test('the live stages keep the exact kvKeys they shipped with', () => {
+  // Same rail as the launch-key test above, extended to every stage that has
+  // already mailed real people: changing one of these makes its cohort look
+  // unmailed and re-fires that email across the whole history.
+  assert.equal(EMAIL_STAGES.first.kvKey, 'anon_lead_sent');
+  assert.equal(EMAIL_STAGES.day1.kvKey, 'anon_lead_24h_sent');
+  assert.equal(EMAIL_STAGES.day2.kvKey, 'anon_lead_48h_sent');
+  assert.equal(EMAIL_STAGES.day3.kvKey, 'anon_lead_72h_sent');
 });
 
 // --- Environment namespacing ----------------------------------------------
@@ -100,6 +111,7 @@ test('the launch stage keeps its one-hour span; the new stages get a retry budge
   assert.equal(LAUNCH_SPAN_MS, HOUR);
   assert.equal(EMAIL_STAGES.day1.spanMs, RETRY_SPAN_MS);
   assert.equal(EMAIL_STAGES.day2.spanMs, RETRY_SPAN_MS);
+  assert.equal(EMAIL_STAGES.day3.spanMs, RETRY_SPAN_MS);
   assert.ok(RETRY_SPAN_MS > LAUNCH_SPAN_MS);
 });
 
@@ -176,9 +188,22 @@ test('resolveStage throws on an unknown id rather than guessing', () => {
 // --- Template ids ----------------------------------------------------------
 
 test('resolveTemplateId reads the stage-specific env var', () => {
-  const env = { BREVO_TEMPLATE_ID_ANON_LEAD: '39', BREVO_TEMPLATE_ID_ANON_LEAD_24H: '41' };
+  const env = {
+    BREVO_TEMPLATE_ID_ANON_LEAD: '39',
+    BREVO_TEMPLATE_ID_ANON_LEAD_24H: '41',
+    BREVO_TEMPLATE_ID_ANON_LEAD_72H: '45',
+  };
   assert.equal(resolveTemplateId(EMAIL_STAGES.first, env), 39);
   assert.equal(resolveTemplateId(EMAIL_STAGES.day1, env), 41);
+  assert.equal(resolveTemplateId(EMAIL_STAGES.day3, env), 45);
+});
+
+test('the 72h stage has no template until its own env var is set', () => {
+  // Its Brevo template does not exist yet. index.js refuses a real run in that
+  // state, which is exactly the rail that keeps this stage dark until someone
+  // sets BREVO_TEMPLATE_ID_ANON_LEAD_72H — the sibling envs must not stand in.
+  const env = { BREVO_TEMPLATE_ID_ANON_LEAD: '39', BREVO_TEMPLATE_ID_ANON_LEAD_48H: '44' };
+  assert.equal(resolveTemplateId(EMAIL_STAGES.day3, env), null);
 });
 
 test('resolveTemplateId returns null when the template is unconfigured', () => {
@@ -211,9 +236,47 @@ test('capForStage never widens an operator cap', () => {
   assert.equal(capForStage(200, EMAIL_STAGES.day2), 10, 'a looser one is pulled down');
 });
 
-test('the deferred 72h discount stage is not defined yet', () => {
-  // It is blocked on Stripe coupon infrastructure and ships separately.
-  // Defining it early would make it eligible to send with no template.
-  assert.equal(STAGE_ORDER.length, 3);
-  assert.ok(!Object.keys(EMAIL_STAGES).some((id) => /72|discount/i.test(id)));
+// --- The 72h offer stage ---------------------------------------------------
+
+test('the sequence is the four emails, in order', () => {
+  assert.deepEqual(STAGE_ORDER, ['first', 'day1', 'day2', 'day3']);
+  assert.deepEqual(Object.keys(EMAIL_STAGES), ['first', 'day1', 'day2', 'day3']);
+});
+
+test('day3 is the 72h email, template-only and uncapped', () => {
+  const stage = EMAIL_STAGES.day3;
+  assert.equal(stage.id, 'day3');
+  assert.equal(stage.label, '72h');
+  assert.equal(stage.delayMs, 72 * HOUR);
+  assert.equal(stage.maxPerRun, null);
+  assert.equal(stage.requiresTailoring, false, 'this email sells an offer, not a rewritten resume');
+  assert.equal(stage.templateEnv, 'BREVO_TEMPLATE_ID_ANON_LEAD_72H');
+});
+
+test('capForStage passes an operator cap straight through at day3', () => {
+  // maxPerRun is null, so the stage adds no ceiling of its own.
+  assert.equal(capForStage(null, EMAIL_STAGES.day3), null);
+  assert.equal(capForStage(25, EMAIL_STAGES.day3), 25);
+});
+
+test("day3's offer is 75% off, frozen, and points at /comeback", () => {
+  // 75 is the same number in three places: this email advertises it,
+  // Standout-pro's /comeback renders its prices from RETARGET_DISCOUNT_PERCENT,
+  // and the Stripe coupon (STRIPE_COUPON_RETARGET_75) charges it. Drift means
+  // the user is shown one number and billed another — see stages.js.
+  const { offer } = EMAIL_STAGES.day3;
+  assert.deepEqual({ ...offer }, { percent: 75, path: '/comeback' });
+  assert.ok(Object.isFrozen(offer), 'a mutable offer could be edited into a mismatch at runtime');
+});
+
+test('only the offer stage carries an offer', () => {
+  assert.equal(EMAIL_STAGES.first.offer, undefined);
+  assert.equal(EMAIL_STAGES.day1.offer, undefined);
+  assert.equal(EMAIL_STAGES.day2.offer, undefined);
+  assert.ok(EMAIL_STAGES.day3.offer);
+});
+
+test('resolveStage knows day3', () => {
+  assert.equal(resolveStage('day3').id, 'day3');
+  assert.throws(() => resolveStage('day4'), /Unknown email stage "day4"/);
 });

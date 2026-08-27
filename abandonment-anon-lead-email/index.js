@@ -84,6 +84,17 @@ function firstNameFor(name) {
 }
 
 /**
+ * The app origin every link in this email is built from. Trimmed, and with any
+ * trailing slash stripped, so `${base}/path` cannot produce a double slash —
+ * the offer URL below joins a path onto it rather than only appending a query
+ * string the way the token links do.
+ */
+function appBaseUrl(env = process.env) {
+  const raw = typeof env.STANDOUT_APP_URL === 'string' ? env.STANDOUT_APP_URL.trim() : '';
+  return (raw || 'https://www.usestandout.today').replace(/\/+$/, '');
+}
+
+/**
  * Both CTAs land on /your-match carrying the same 14-day lead token; `next`
  * tells the page to continue straight to the full match list. Query string
  * only — the app's edge middleware swallows dotted path segments.
@@ -95,7 +106,7 @@ function buildLinks(lead, job) {
   const secret = process.env.EMAIL_LINK_SECRET;
   if (!secret) return null;
 
-  const appUrl = process.env.STANDOUT_APP_URL || 'https://www.usestandout.today';
+  const appUrl = appBaseUrl();
   const token = signLeadToken({ sv: lead.survey_id, jb: job.id }, secret);
 
   const jobUrl = `${appUrl}/your-match?${new URLSearchParams({ t: token, ...UTM }).toString()}`;
@@ -136,6 +147,29 @@ function buildPayload(lead, job, pct, reasons, links, stage, bullets) {
     params.TAILORED_BULLETS = bullets;
     bullets.forEach((b, i) => { params[`BULLET_${i + 1}`] = b; });
     params.BULLET_COUNT = bullets.length;
+  }
+
+  // The discount, for the stage that carries one — conditional exactly like the
+  // bullets above, so a stage without an offer sends neither param and its
+  // template can never reference a figure the worker did not supply.
+  //
+  // OFFER_URL is a PLAIN link: /comeback does not consume a lead token (it is a
+  // cold page — the lead's restored survey comes from the account-claim path
+  // after checkout, not from us), so there is nothing to sign into it. The
+  // token-bearing JOB_URL / MATCHES_URL stay in the payload above, which is
+  // what lets the template keep a secondary "see your match" link.
+  //
+  // The offer is ANNUAL-ONLY — the product pins the plan to pro_yearly
+  // server-side on this checkout source — so the template's copy has to say
+  // "first year". A bare "75% off" would promise a monthly discount that
+  // checkout will not honour.
+  const { offer } = resolveStage(stage);
+  if (offer) {
+    params.OFFER_PERCENT = offer.percent;
+    params.OFFER_URL = `${appBaseUrl()}${offer.path}?${new URLSearchParams({
+      ...UTM,
+      utm_campaign: 'abandonment_72h',
+    }).toString()}`;
   }
 
   return {
@@ -636,7 +670,14 @@ module.exports = handler;
 module.exports.run = run;
 module.exports.handler = handler;
 module.exports.createHandler = createHandler;
-module.exports._internals = { formatSalary, formatJobAge, firstNameFor, buildLinks, buildPayload };
+module.exports._internals = {
+  formatSalary,
+  formatJobAge,
+  firstNameFor,
+  appBaseUrl,
+  buildLinks,
+  buildPayload,
+};
 
 // Run directly via `node index.js`
 if (require.main === module) {
