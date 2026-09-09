@@ -104,14 +104,15 @@ test('computeWindow: each stage selects the slice that ended delayMs ago', () =>
   }
 });
 
-test('the launch stage keeps its one-hour span; the new stages get a retry budget', () => {
-  // Widening `first` is the right fix for the same silent loss, but it changes
-  // a live email's behaviour and earns a one-off catch-up cohort. Deliberate.
-  assert.equal(EMAIL_STAGES.first.spanMs, LAUNCH_SPAN_MS);
-  assert.equal(LAUNCH_SPAN_MS, HOUR);
-  assert.equal(EMAIL_STAGES.day1.spanMs, RETRY_SPAN_MS);
-  assert.equal(EMAIL_STAGES.day2.spanMs, RETRY_SPAN_MS);
-  assert.equal(EMAIL_STAGES.day3.spanMs, RETRY_SPAN_MS);
+test('every stage now gets the same three-hour retry budget', () => {
+  // `first` kept LAUNCH_SPAN_MS only because widening it would have changed a
+  // live email's behaviour for no other reason. The 4h cut-over changes that
+  // email's behaviour anyway, so it took the retry budget in the same change.
+  for (const id of STAGE_ORDER) {
+    assert.equal(EMAIL_STAGES[id].spanMs, RETRY_SPAN_MS, `${id} needs three chances`);
+  }
+  assert.equal(RETRY_SPAN_MS, 3 * HOUR);
+  assert.equal(LAUNCH_SPAN_MS, HOUR, 'kept as the number that sizes the cut-over catch-up cohort');
   assert.ok(RETRY_SPAN_MS > LAUNCH_SPAN_MS);
 });
 
@@ -128,9 +129,9 @@ test('a deferred lead at a retry-span stage is still in range an hour later', ()
   assert.equal(covered, 3, 'three hourly runs should each still see this lead');
 });
 
-test('the launch stage gets exactly one chance — the known limitation', () => {
-  // Documented rather than fixed, so the asymmetry is visible instead of
-  // being mistaken for an oversight.
+test('the first stage now gets three chances too — the old limitation is gone', () => {
+  // It used to get exactly one, and a deferred lead was lost silently. This is
+  // the assertion that flipped with the 4h cut-over.
   const stage = EMAIL_STAGES.first;
   const survey = NOW - stage.delayMs - 30 * 60 * 1000;
   let covered = 0;
@@ -138,16 +139,16 @@ test('the launch stage gets exactly one chance — the known limitation', () => 
     const win = computeWindow(NOW + n * HOUR, {}, stage);
     if (survey >= win.startMs && survey <= win.endMs) covered++;
   }
-  assert.equal(covered, 1, 'a deferred 1h lead falls out of range next tick');
+  assert.equal(covered, 3, 'a deferred 4h lead is still in range on the next two ticks');
 });
 
-test('computeWindow: the two-argument call is byte-identical to the 1h stage', () => {
+test('computeWindow: the two-argument call is byte-identical to the first stage', () => {
   const legacy = computeWindow(NOW, {});
   const explicit = computeWindow(NOW, {}, EMAIL_STAGES.first);
   assert.equal(legacy.startMs, explicit.startMs);
   assert.equal(legacy.endMs, explicit.endMs);
-  assert.equal(legacy.startMs, NOW - 2 * HOUR, 'the launch window was [now-2h, now-1h]');
-  assert.equal(legacy.endMs, NOW - HOUR);
+  assert.equal(legacy.startMs, NOW - 7 * HOUR, 'the 4h window is [now-7h, now-4h]');
+  assert.equal(legacy.endMs, NOW - 4 * HOUR);
 });
 
 test('computeWindow: stage windows do not overlap', () => {
@@ -164,11 +165,11 @@ test('computeWindow: backfill on a later stage is clamped, never inverted', () =
   assert.equal(win.endMs - win.startMs, EMAIL_STAGES.day2.spanMs, "falls back to the stage's own span");
 });
 
-test('computeWindow: a real backfill on the 1h stage is unchanged', () => {
+test('computeWindow: a real backfill on the first stage keeps its formula', () => {
   const win = computeWindow(NOW, { BACKFILL_DAYS: '14' }, EMAIL_STAGES.first);
   assert.equal(win.mode, 'backfill');
-  assert.equal(win.startMs, NOW - 14 * 24 * HOUR, 'the launch backfill formula still applies');
-  assert.equal(win.endMs, NOW - HOUR);
+  assert.equal(win.startMs, NOW - 14 * 24 * HOUR, 'the backfill formula still applies');
+  assert.equal(win.endMs, NOW - 4 * HOUR, 'and the upper bound is the stage delay');
 });
 
 // --- resolveStage ----------------------------------------------------------
@@ -189,7 +190,7 @@ test('resolveStage throws on an unknown id rather than guessing', () => {
 
 test('resolveTemplateId reads the stage-specific env var', () => {
   const env = {
-    BREVO_TEMPLATE_ID_ANON_LEAD: '39',
+    BREVO_TEMPLATE_ID_ANON_LEAD: '39',  // any id — `first` gets a NEW template with the 4h copy
     BREVO_TEMPLATE_ID_ANON_LEAD_24H: '41',
     BREVO_TEMPLATE_ID_ANON_LEAD_72H: '45',
   };
@@ -236,6 +237,58 @@ test('capForStage never widens an operator cap', () => {
   assert.equal(capForStage(200, EMAIL_STAGES.day2), 10, 'a looser one is pulled down');
 });
 
+// --- The 4h offer stage ----------------------------------------------------
+
+test('first is the 4h email, template-only and uncapped', () => {
+  const stage = EMAIL_STAGES.first;
+  assert.equal(stage.id, 'first');
+  assert.equal(stage.label, '4h');
+  assert.equal(stage.delayMs, 4 * HOUR, 'was 1h until the 2026-09-09 cut-over');
+  assert.equal(stage.spanMs, RETRY_SPAN_MS);
+  assert.equal(stage.maxPerRun, null);
+  assert.equal(stage.requiresTailoring, false);
+  assert.equal(stage.templateEnv, 'BREVO_TEMPLATE_ID_ANON_LEAD', 'same env var, new template');
+});
+
+test('the 4h cut-over did NOT move the send-once receipt', () => {
+  // The single most destructive thing this change could have done. The key is
+  // what dedupes every lead already mailed under the 1h regime, so renaming it
+  // would mail the whole history a second first-stage email on the next tick.
+  assert.equal(EMAIL_STAGES.first.kvKey, 'anon_lead_sent');
+  assert.equal(kvKeyFor('lead@example.com', EMAIL_STAGES.first), 'anon_lead_sent:lead@example.com');
+});
+
+test("first's offer is 75% off the first MONTH, tokenized, and frozen", () => {
+  // Every figure the 4h email states lives in this object and nowhere else in
+  // the worker. The percent must equal LEAD_OFFER_DISCOUNT_PERCENT in
+  // Standout-pro's shared/retarget-offer.ts, and the prices must equal the
+  // pro_monthly Group A sticker ($40/mo) discounted by it ($10 for month one).
+  const { offer } = EMAIL_STAGES.first;
+  assert.deepEqual({ ...offer }, {
+    percent: 75,
+    path: '/your-match',
+    tokenized: true,
+    param: 'monthly75',
+    firstTermPrice: '$10',
+    renewalPrice: '$40/mo',
+    cadence: 'month',
+  });
+  assert.ok(Object.isFrozen(offer), 'a mutable offer could be edited into a mismatch at runtime');
+});
+
+test('the two offers are independent — different cadence, different landing page', () => {
+  // They share the number 75 today and are still two separate parity rules
+  // against two different product surfaces. Collapsing them into one constant
+  // would let a change to the monthly offer silently move the annual one.
+  const monthly = EMAIL_STAGES.first.offer;
+  const annual = EMAIL_STAGES.day3.offer;
+  assert.notEqual(monthly.path, annual.path);
+  assert.equal(monthly.tokenized, true, 'the monthly offer lands on the token-bearing page');
+  assert.equal(annual.tokenized, undefined, '/comeback is cold — no token to sign in');
+  assert.equal(monthly.cadence, 'month');
+  assert.equal(annual.cadence, undefined, "the annual copy's figures are the template's");
+});
+
 // --- The 72h offer stage ---------------------------------------------------
 
 test('the sequence is the four emails, in order', () => {
@@ -269,11 +322,11 @@ test("day3's offer is 75% off, frozen, and points at /comeback", () => {
   assert.ok(Object.isFrozen(offer), 'a mutable offer could be edited into a mismatch at runtime');
 });
 
-test('only the offer stage carries an offer', () => {
-  assert.equal(EMAIL_STAGES.first.offer, undefined);
-  assert.equal(EMAIL_STAGES.day1.offer, undefined);
-  assert.equal(EMAIL_STAGES.day2.offer, undefined);
-  assert.ok(EMAIL_STAGES.day3.offer);
+test('exactly two stages carry an offer, and they are the first and the last', () => {
+  const offering = STAGE_ORDER.filter((id) => EMAIL_STAGES[id].offer);
+  assert.deepEqual(offering, ['first', 'day3']);
+  assert.equal(EMAIL_STAGES.day1.offer, undefined, 'the 24h email keeps the free apply');
+  assert.equal(EMAIL_STAGES.day2.offer, undefined, 'the 48h email sells the tailored resume');
 });
 
 test('resolveStage knows day3', () => {

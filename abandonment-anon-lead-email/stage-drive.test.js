@@ -1,8 +1,10 @@
 /**
- * Stubbed drives of run() for the two rails added with the email sequence:
+ * Stubbed drives of run() for the rails added with the email sequence:
  *
  *   1. A stage will not send without its own Brevo template.
  *   2. A lead who paid between cohort-build and dispatch is not mailed.
+ *   3. Each stage puts its own params on the wire — the 4h offer's tokenized
+ *      link, and nothing offer-shaped on the stages that sell no discount.
  *
  * Same technique as dedup-guard.test.js: collaborators are patched on their
  * module objects BEFORE index.js is required, because index.js destructures
@@ -41,7 +43,7 @@ const JOB = {
 
 // Controlled per test.
 const stub = { unpaid: true, unpaidThrows: false };
-const calls = { send: 0, marked: [] };
+const calls = { send: 0, marked: [], params: [] };
 
 queries.findAnonLeads = async () => [LEAD];
 queries.findFeaturedJobs = async () => ({
@@ -56,8 +58,9 @@ queries.isStillUnpaid = async () => {
   if (stub.unpaidThrows) throw new Error('supabase blip');
   return stub.unpaid;
 };
-brevo.sendJobEmail = async () => {
+brevo.sendJobEmail = async (payload) => {
   calls.send++;
+  calls.params.push(payload.params);
   return 'stub-message-id';
 };
 sentTracker.hasBeenSent = async () => false;
@@ -102,6 +105,7 @@ async function drive(overrides, fn) {
 
   calls.send = 0;
   calls.marked = [];
+  calls.params = [];
   stub.unpaid = true;
   stub.unpaidThrows = false;
 
@@ -126,7 +130,7 @@ test('run(): a real run refuses to start without a template for its stage', asyn
   assert.equal(calls.send, 0, 'nothing may be sent when the template is missing');
 });
 
-test('run(): the 1h template does not satisfy a later stage', async () => {
+test('run(): the first stage\'s template does not satisfy a later stage', async () => {
   // The failure mode this prevents: shipping a new cron that inherits Email 1's
   // template and mails Email 1's copy on Email 2's schedule.
   await assert.rejects(
@@ -145,11 +149,73 @@ test('run(): a dry run without a template warns and continues', async () => {
   assert.equal(calls.send, 0, 'a dry run never sends');
 });
 
-test('run(): an unset EMAIL_STAGE is the 1h email, exactly as before the sequence', async () => {
+test('run(): an unset EMAIL_STAGE is stage `first`, exactly as before the sequence', async () => {
   const { result } = await drive({ DRY_RUN: 'false', BREVO_TEMPLATE_ID_ANON_LEAD: '39' }, () => run());
   assert.equal(calls.send, 1);
   assert.equal(result.sent, 1);
   assert.equal(calls.marked[0].stageId, 'first', 'the default stage marks the launch keyspace');
+});
+
+test('run(): the first stage sends the 4h offer end to end', async () => {
+  // buildPayload is unit-tested in offer-email.test.js; what this pins is that
+  // a whole run actually puts those params on the wire, with a token minted by
+  // the run itself rather than a stub.
+  await drive({ DRY_RUN: 'false', BREVO_TEMPLATE_ID_ANON_LEAD: '46' }, () => run());
+
+  assert.equal(calls.send, 1);
+  const params = calls.params[0];
+  assert.equal(params.OFFER_PERCENT, 75);
+  assert.equal(params.OFFER_FIRST_PRICE, '$10');
+  assert.equal(params.OFFER_RENEWAL_PRICE, '$40/mo');
+
+  const url = new URL(params.OFFER_URL);
+  assert.equal(url.pathname, '/your-match');
+  assert.ok(url.searchParams.get('t'), 'a real signed lead token, not a stub');
+  assert.equal(url.searchParams.get('offer'), 'monthly75');
+  assert.equal(url.searchParams.get('utm_campaign'), 'abandonment_4h_offer');
+  assert.equal(url.searchParams.get('utm_content'), 'first');
+});
+
+test('run(): the 24h email keeps the free apply and sends no offer params', async () => {
+  // The 4h cut-over changed one stage. This is the neighbour it must not have
+  // touched — a stray OFFER_PERCENT here advertises a discount template 43 has
+  // no copy for.
+  await drive(
+    { EMAIL_STAGE: 'day1', DRY_RUN: 'false', BREVO_TEMPLATE_ID_ANON_LEAD_24H: '41' },
+    () => run()
+  );
+
+  assert.equal(calls.send, 1);
+  const params = calls.params[0];
+  for (const key of ['OFFER_PERCENT', 'OFFER_URL', 'OFFER_FIRST_PRICE', 'OFFER_RENEWAL_PRICE']) {
+    assert.ok(!(key in params), `day1 must omit ${key}`);
+  }
+  assert.ok(params.JOB_URL.includes('utm_campaign=anon_lead_24h'), 'but it does get its own campaign');
+  assert.ok(params.JOB_URL.includes('utm_content=day1'));
+});
+
+test('run(): the dry-run self-check prints every CTA, offer link included', async () => {
+  // The operator's only sight of the offer URL before a real send. It has to
+  // show the `t=` and the `offer=` together — a link missing either is the
+  // failure a rehearsal exists to catch.
+  const lines = [];
+  const realLog = console.log;
+  try {
+    await drive({ DRY_RUN: 'true', BREVO_TEMPLATE_ID_ANON_LEAD: '46' }, () => {
+      console.log = (...args) => lines.push(args.join(' '));
+      return run();
+    });
+  } finally {
+    console.log = realLog;
+  }
+
+  const offerLine = lines.find((l) => l.startsWith('[DRY RUN] OFFER_URL:'));
+  assert.ok(offerLine, `no OFFER_URL self-check line in: ${JSON.stringify(lines)}`);
+  assert.ok(offerLine.includes('offer=monthly75'));
+  assert.ok(offerLine.includes('/your-match?t='));
+  assert.ok(lines.some((l) => l.startsWith('[DRY RUN] JOB_URL:')));
+  assert.ok(lines.some((l) => l.startsWith('[DRY RUN] MATCHES_URL:')));
+  assert.equal(calls.send, 0, 'a dry run still sends nothing');
 });
 
 test('run(): the send is marked against its own stage', async () => {
