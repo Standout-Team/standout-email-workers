@@ -17,6 +17,11 @@ in to marketing, hit the paywall and left without ever creating an account. Ther
 account to magic-link them into, so every CTA carries a signed 14-day lead token that
 `/your-match` trades for their restored survey + resume and **one free apply**.
 
+Four emails, two of which sell a discount: the **4h** email offers 75% off the first month
+of Pro Monthly, the **24h** email offers the free apply, the **48h** email shows the lead
+their application already written, and the **72h** email offers 75% off the first year.
+See [Two offers](#two-offers-4h-monthly-and-72h-annual).
+
 Audience: `surveys` with `marketing_opt_in`, `user_id IS NULL`, a parsed resume carrying a
 plausible email, created inside the run's window (below). Excludes existing `profiles`,
 `marketing_suppressions`, and recent `paid` `pending_subscriptions`. A `created`-but-unpaid
@@ -26,15 +31,22 @@ is dropped if it closed or went stale (>3 days).
 
 **Free-apply grants** are a stage-specific exclusion, and only one stage's:
 
-| Grant state | `first` (1h) | `day1` (24h) | `day2` (48h) | `day3` (72h) |
+| Grant state | `first` (4h) | `day1` (24h) | `day2` (48h) | `day3` (72h) |
 | --- | --- | --- | --- | --- |
 | No grant | sends | sends | sends | sends |
 | Claimed, `redeemed_at IS NULL` | sends | sends | sends | sends |
 | **Redeemed** (`redeemed_at IS NOT NULL`) | sends | **excluded** | sends | sends |
 
-*Claiming* the free apply happens on `/your-match`, the destination of Email 1's own CTA,
-so it excludes nothing anywhere — clicking Email 1 must not end the sequence (owner
-decision **2026-08-21**, which removed `free_apply_grants` as a blanket exclusion).
+*Claiming* the free apply happens on `/your-match`, which is where the 4h email's own CTA
+lands too, so it excludes nothing anywhere — **clicking the 4h email must not end the
+sequence** (owner decision **2026-08-21**, which removed `free_apply_grants` as a blanket
+exclusion; the 4h email's CTA changed on 2026-09-09 but the rule did not). Note that the
+4h **offer** click does not claim the survey either: `/your-match?offer=monthly75` binds
+`surveys.user_id` only when the lead actually **pays**, on the Stripe webhook. A lead who
+clicks the offer and doesn't buy keeps `user_id IS NULL` and therefore stays in the `day1`
+audience — which is the point, since the 24h email is the one that offers them the free
+apply. A lead who *does* buy drops out of every later stage on the base `user_id IS NULL`
+predicate, with the `profiles` exclusion and the pre-dispatch paid re-check behind it.
 *Redeeming* it means the lead actually applied, and `post-apply-followup-email/` mails them
 **template 42** 24–25h later with a pick-a-plan CTA. Template 43 would land beside it, so
 the redeemed lead's 24h touch belongs to template 42 and `day1` stands down (owner
@@ -72,14 +84,16 @@ Full spec + ops runbook: `docs/FREE_APPLY_LEADS.md` in the main `Standout-pro` r
 
 #### Backfill procedure
 
-By default the worker only looks at surveys created **1–2 hours ago** — an hourly cron
-over a 1-hour-wide window, so each survey is considered exactly once and the audience
-marches forward with the clock. To reach abandoners from *before* the worker went live,
-set two env vars on the Vercel project. **The cron itself never changes.**
+By default each stage only looks at its own slice: the `spanMs`-wide window that ended
+`delayMs` ago — **4–7 hours ago** for stage `first`, 24–27h for `day1`, and so on. An
+hourly cron over a 3-hour-wide window means each survey is considered three times (the
+retry budget in `stages.js`) and the KV sent-tracker is what keeps that to one email. To
+reach abandoners from *before* the worker went live, set two env vars on the Vercel
+project. **The cron itself never changes.**
 
 | Variable | Effect |
 | --- | --- |
-| `BACKFILL_DAYS` | Widens the window to `[now − N days, now − 1h]`. Integer **1–30**; out-of-range clamps, anything invalid logs a warning and runs the normal window. The backfill window is a *superset* of the normal one, so new abandoners keep being covered while the backlog drains. |
+| `BACKFILL_DAYS` | Widens the window to `[now − N days, now − delayMs]`. Integer **1–30**; out-of-range clamps, anything invalid logs a warning and runs the normal window. The backfill window is a *superset* of the normal one — same upper bound — so new abandoners keep being covered while the backlog drains. |
 | `SEND_CAP` | Max real sends per run. Defaults to **50** in backfill mode, uncapped in normal mode. Candidates past the cap are left for the next hourly run. |
 
 1. Set `BACKFILL_DAYS=14` (optionally `SEND_CAP`) with **`DRY_RUN=true`**, and redeploy.
@@ -88,8 +102,11 @@ set two env vars on the Vercel project. **The cron itself never changes.**
    selected this run (cap=50, 262 left for later runs)` — then
    `[DRY RUN COMPLETE] Would send 50 of 312 eligible`. The cohort line lands *before* the
    per-lead work, so you get the count even if the dry run is slow.
-3. Sanity-check the count and the token/`JOB_URL` self-check lines, then set
-   `DRY_RUN=false` and redeploy.
+3. Sanity-check the count and the self-check lines. Every dry run prints `JOB_URL`,
+   `MATCHES_URL`, the decoded token payload and — on the two stages that carry an offer —
+   `OFFER_URL`. On the 4h stage that line is the one to read closely: it is the only link
+   in the sequence carrying both a lead token and an offer flag, so it must contain `t=`
+   *and* `offer=monthly75`. Then set `DRY_RUN=false` and redeploy.
 4. The cron drains up to `SEND_CAP` per hour, **newest abandoner first** (freshest intent
    converts best; the tail drains over subsequent runs). Each run logs
    `N remaining after this run`.
@@ -200,7 +217,7 @@ If nothing sends, the logs name the reason rather than making you guess:
 | Log line | Meaning |
 | --- | --- |
 | `TARGET NOT FOUND: <email>` | Not in the run's candidate set — their survey is outside the window (raise `BACKFILL_DAYS`) or they fail the audience criteria (opt-in, anonymous, parsed resume email). |
-| `TARGETED MODE: N target(s) dropped by the exclusion set` | They have a profile, are suppressed, or have a paid checkout in the last 7 days — **and, on `day1` only**, they have already *redeemed* a free apply, whose 24h touch belongs to the post-apply follow-up (template 42) instead (2026-08-24). Merely *claiming* a grant is **not** an exclusion at any stage (2026-08-21), and `day2` still sends to appliers. The `day1` log line names the extra reason. |
+| `TARGETED MODE: N target(s) dropped by the exclusion set` | They have a profile, are suppressed, have bought through the 4h offer (which binds `surveys.user_id`, so their survey stops matching the audience at all), or have a paid checkout in the last 7 days — **and, on `day1` only**, they have already *redeemed* a free apply, whose 24h touch belongs to the post-apply follow-up (template 42) instead (2026-08-24). Merely *claiming* a grant is **not** an exclusion at any stage (2026-08-21), and `day2` still sends to appliers. The `day1` log line names the extra reason. |
 | `TARGETED MODE: N target(s) dropped as international` | Their resume phone or location reads as outside the US. Canada counts as eligible. |
 | `<email> converted since the cohort was built` | The send-time paid re-check caught a lead who paid between the cohort query and dispatch. Working as intended. |
 | `TARGETED MODE: N target(s) were already mailed` | The sent-tracker is one-send-per-lead-email **forever**, and targeting does not reset it. |
@@ -288,7 +305,7 @@ These configure `abandonment-anon-lead-email/`, the only worker that still runs.
 | `SUPABASE_URL`                | Supabase project URL                                          |
 | `SUPABASE_SERVICE_KEY`        | Service role key (read access is all that's needed)           |
 | `BREVO_API_KEY`               | Brevo API key                                                 |
-| `BREVO_TEMPLATE_ID_ANON_LEAD` | Brevo template for the **1h** email (stage `first`) — live, id **39** |
+| `BREVO_TEMPLATE_ID_ANON_LEAD` | Brevo template for the **4h** offer email (stage `first`) — **new template, set via `BREVO_TEMPLATE_ID_ANON_LEAD`**; 39 stays as the retired 1h free-apply email |
 | `BREVO_TEMPLATE_ID_ANON_LEAD_24H` | Brevo template for the **24h** email (stage `day1`) — id **43** |
 | `BREVO_TEMPLATE_ID_ANON_LEAD_48H` | Brevo template for the **48h** email (stage `day2`) — id **44** |
 | `BREVO_TEMPLATE_ID_ANON_LEAD_72H` | Brevo template for the **72h** offer email (stage `day3`) — id **set when created**. Until it is set the stage refuses every real run, which is how it stays dark until the template exists. |
@@ -305,17 +322,34 @@ These configure `abandonment-anon-lead-email/`, the only worker that still runs.
 
 | Stage | Template | Subject |
 | --- | --- | --- |
-| `first` | **39** (live, do not touch) | 🔥 `{{FIRST_NAME}}`, this one's for you — … |
+| `first` | **new template**, set via `BREVO_TEMPLATE_ID_ANON_LEAD` | the 4h "we found the best job for you" email, CTA = 75% off month one — see [Two offers](#two-offers-4h-monthly-and-72h-annual) |
 | `day1` | **43** | Hey `{{FIRST_NAME}}`, `{{COMPANY_NAME}}` is looking for someone like you |
 | `day2` | **44** | `{{FIRST_NAME}}`, your application to `{{COMPANY_NAME}}` is already written |
-| `day3` | **set when created** (not built yet) | the 75%-off-first-year offer — see [The 72h offer](#the-72h-offer-75-off-the-first-year) |
+| `day3` | **set when created** (not built yet) | the 75%-off-first-year offer — see [Two offers](#two-offers-4h-monthly-and-72h-annual) |
 
-43 and 44 are built from 39's own stylesheet so the sequence reads as one
-system, and the 72h template should be too. Every `{{ params.X }}` in them is a
-param `buildPayload` actually sends — a token the worker does not send renders
-empty, silently, which is how a half-rendered email ships. The 72h template adds
-exactly two: `{{ params.OFFER_PERCENT }}` and `{{ params.OFFER_URL }}`, and it
-still receives `JOB_URL` / `MATCHES_URL` for a secondary "see your match" link.
+**Template 39 is retired**, not repointed. It is the 1h free-apply email; the
+4h email keeps its value prop but swaps its primary CTA for the monthly offer,
+so it is a new template and `BREVO_TEMPLATE_ID_ANON_LEAD` must be pointed at
+it. 39 stays in Brevo as the record of what the 1h email said — leave it alone.
+
+43, 44 and the new 4h template are built from 39's own stylesheet so the
+sequence reads as one system, and the 72h template should be too. Every
+`{{ params.X }}` in them is a param `buildPayload` actually sends — a token the
+worker does not send renders empty, silently, which is how a half-rendered
+email ships. The offer params are:
+
+| Param | 4h (`first`) | 72h (`day3`) |
+| --- | --- | --- |
+| `OFFER_PERCENT` | `75` | `75` |
+| `OFFER_URL` | `/your-match?t=…&offer=monthly75&…` — **token-bearing** | `/comeback?…` — no token |
+| `OFFER_FIRST_PRICE` | `$10` | *not sent* |
+| `OFFER_RENEWAL_PRICE` | `$40/mo` | *not sent* |
+
+`day1` and `day2` receive **none** of them — a stage without an offer sends no
+`OFFER_*` param at all rather than an empty one, and that rule is per param, so
+the 72h template must not reference the two price tokens it does not receive
+(its annual figures are its own copy). Both offer templates still receive
+`JOB_URL` / `MATCHES_URL` for the "see your match" link.
 
 All of them carry the same footer, corrected 2026-08-21:
 
@@ -338,22 +372,44 @@ would render empty. Use 43.
 ### The sequence, and running it in staging
 
 One worker, four emails, selected by `EMAIL_STAGE`. Each stage sends to leads
-whose survey settled `delayMs` ago — `first` at 1h, `day1` at 24h, `day2` at
+whose survey settled `delayMs` ago — `first` at 4h, `day1` at 24h, `day2` at
 48h, `day3` at 72h — so each hourly run considers exactly one slice of surveys
-per stage and the cohorts never overlap. Stage definitions live in `stages.js`;
-adding an email means adding an entry there plus its Brevo template. The 72h
-discount email was deliberately absent until 2026-08-27; its coupon blocker is
-resolved by reusing the product's live retargeting offer (below) rather than
-minting new coupon infrastructure.
+per stage and the cohorts never overlap. Every stage's window is `spanMs` = 3h
+wide, a retry budget rather than a cohort size: a lead a run defers is left
+unmarked, so the next two hourly ticks can pick it up. Stage definitions live
+in `stages.js`; adding an email means adding an entry there plus its Brevo
+template. The 72h discount email was deliberately absent until 2026-08-27; its
+coupon blocker is resolved by reusing the product's live retargeting offer
+(below) rather than minting new coupon infrastructure.
 
 Two rails you should know about before touching this:
 
 - **`stages.first.kvKey` is `anon_lead_sent`, not `anon_lead_1h_sent`.** The
   implementation spec says otherwise and the spec is wrong. Renaming it makes
-  every lead ever mailed look unmailed, and the 1h email re-fires across the
+  every lead ever mailed look unmailed, and the first email re-fires across the
   entire history on the next tick. `stages.test.js` asserts the exact string.
+  It survived the 4h cut-over unchanged, deliberately — see below.
 - **A real run refuses to start without a template for its stage.** A dry run
   warns instead, which is how you rehearse a stage before its template exists.
+
+#### Cut-over: 1h → 4h (stage `first`)
+
+Stage `first` was the **1h** free-apply email until 2026-09-09. It is now the
+**4h** monthly-offer email, on a new Brevo template, with `spanMs` widened from
+1h to the 3h retry budget every other stage already had. Three things to know
+on the deploy:
+
+- **Leads already mailed under the 1h regime get nothing.** `kvKey` did not
+  move, so their send-once receipt still dedupes them and no one receives a
+  second first-stage email. This is the single reason that key is untouchable.
+- **Leads younger than 1h at deploy get the 4h email** when they age into the
+  new window. Nothing is lost at the boundary.
+- **Set `SEND_CAP` for the first run.** Widening the span means everyone whose
+  survey settled between 4h and 7h ago is in range at once — a one-off catch-up
+  cohort of up to ~3× a normal hourly cohort, none of it deduped, because those
+  leads aged past the old 1h-wide window while it was still 1h wide. From the
+  second tick on, every survey in the window has already been seen and the KV
+  receipt carries it, so the cap can come back off.
 
 **One entrypoint per stage, and it has to be that way.** A Vercel cron entry
 carries only a `path` and a `schedule` — there are **no per-cron environment
@@ -364,7 +420,7 @@ day instead of running the sequence. So each stage gets a thin file under
 
 | Cron path | Stage | Schedule |
 | --- | --- | --- |
-| `/api/abandonment-anon-lead-email` | `first` (1h) | `0 * * * *` |
+| `/api/abandonment-anon-lead-email` | `first` (4h) | `0 * * * *` |
 | `/api/abandonment-anon-lead-email-72h` | `day3` (72h) | `10 * * * *` |
 | `/api/abandonment-anon-lead-email-24h` | `day1` (24h) | `20 * * * *` |
 | `/api/abandonment-anon-lead-email-48h` | `day2` (48h) | `40 * * * *` |
@@ -377,7 +433,7 @@ the four match-RPC consumers at least ten minutes apart.
 
 A manual invocation can also pass `?stage=day1`, which is how staging picks a
 stage without a redeploy. An unknown value fails the request rather than
-falling back to the 1h email.
+falling back to stage `first`.
 
 **Staging must set `KV_ENV_PREFIX`.** Vercel only fires crons on production
 deployments, so a staging run is a manual invocation — and without an
@@ -397,53 +453,105 @@ Tuning and operational vars (`BACKFILL_DAYS`, `SEND_CAP`, `MATCH_CONCURRENCY`,
 `RUN_BUDGET_MS`, `MATCH_ROLE_FANOUT`, `TARGET_EMAILS`) are documented in their own sections
 above.
 
-### The 72h offer: 75% off the first year
+### Two offers: 4h monthly and 72h annual
 
-The last email in the sequence is the only one that carries a discount. It
-advertises **75% off the first year** and sends the click to the product's own
-`/comeback` page — the paid-retargeting offer that is already live in
-Standout-pro, not new infrastructure built for this worker. Nothing on the
-product side changed to ship this email.
+Two of the four emails carry a discount, and they are **not** the same offer.
+Both happen to be 75% off a first term; they sell different cadences on
+different landing pages, and each has its own parity rule.
+
+| | **4h** (`first`) | **72h** (`day3`) |
+| --- | --- | --- |
+| Sells | 75% off the first **month** of Pro Monthly | 75% off the first **year** of the annual plan |
+| Copy must say | "$10 for month one, then $40/mo" | "first year" ($40 year one, renewing at the $160 sticker) |
+| Lands on | `/your-match` — the sequence's own landing page | `/comeback` — the live paid-retargeting page |
+| Lead token | **yes** (`t=…`) | no |
+| Flag the app reads | `offer=monthly75` | — (the page *is* the offer) |
+| `utm_campaign` | `abandonment_4h_offer` | `abandonment_72h` |
+
+Full 4h offer URL:
+
+```
+<STANDOUT_APP_URL>/your-match?t=<lead token>&offer=monthly75
+  &utm_source=brevo&utm_medium=email&utm_campaign=abandonment_4h_offer&utm_content=first
+```
+
+#### Where each number lives
 
 | Piece | Where it lives | What it does |
 | --- | --- | --- |
-| `stages.day3.offer` | `abandonment-anon-lead-email/stages.js` | `{ percent: 75, path: '/comeback' }` — the only place this worker states the number |
-| `OFFER_PERCENT` / `OFFER_URL` | `buildPayload` in `index.js` | sent **only** for a stage carrying an `offer`; the URL is `<STANDOUT_APP_URL>/comeback?utm_source=brevo&utm_medium=email&utm_campaign=abandonment_72h` |
-| `RETARGET_DISCOUNT_PERCENT` | Standout-pro `shared/retarget-offer.ts` | `= 75`; `/comeback` renders its prices from it |
-| `STRIPE_COUPON_RETARGET_75` | Standout-pro Vercel env | the Stripe coupon actually charged. Both checkout routes **hard-fail (503)** when it is unset rather than quietly charging full price |
+| `stages.first.offer` | `abandonment-anon-lead-email/stages.js` | `{ percent: 75, path: '/your-match', tokenized: true, param: 'monthly75', firstTermPrice: '$10', renewalPrice: '$40/mo', cadence: 'month' }` — the only place this worker states the monthly figures |
+| `stages.day3.offer` | same file | `{ percent: 75, path: '/comeback' }` — the only place it states the annual percent |
+| `OFFER_PERCENT` / `OFFER_URL` / `OFFER_FIRST_PRICE` / `OFFER_RENEWAL_PRICE` | `buildPayload` in `index.js` | sent **only** for a stage carrying an `offer`, and only the params that stage actually states. `index.js` contains no percent and no price of its own |
+| `LEAD_OFFER_DISCOUNT_PERCENT` | Standout-pro `shared/retarget-offer.ts` | `= 75`; `/your-match?offer=monthly75` renders the monthly offer from it, against the pro_monthly **Group A** sticker ($40/mo → $10 month one) |
+| `RETARGET_DISCOUNT_PERCENT` | same file | `= 75`; `/comeback` renders its annual prices from it |
+| `STRIPE_COUPON_RETARGET_75` | Standout-pro Vercel env | the Stripe coupon actually charged on the annual path. Both checkout routes **hard-fail (503)** when it is unset rather than quietly charging full price |
 
-**The percent is one number in three places, and they must not drift.** This
-email advertises it, `/comeback` renders prices from it, Stripe charges it. If
-`stages.day3.offer.percent` ever diverges from `RETARGET_DISCOUNT_PERCENT` or
-from the coupon's `percent_off`, the lead is shown one number and billed
-another — the failure mode both codebases treat as unacceptable. Change all
-three in the same sitting or none of them.
+**Each percent is one number in three places, and they must not drift.** The
+email advertises it, the landing page renders prices from it, Stripe charges
+it. If `stages.first.offer.percent` diverges from `LEAD_OFFER_DISCOUNT_PERCENT`
+(or its prices from the pro_monthly Group A sticker), or `stages.day3.offer.percent`
+from `RETARGET_DISCOUNT_PERCENT` or the coupon's `percent_off`, the lead is
+shown one number and billed another — the failure mode both codebases treat as
+unacceptable. Change all three in the same sitting or none of them.
 
-**Annual only.** The offer is 75% off the first year of the annual plan ($40 for
-year one, renewing at the $160 sticker). A 75%-off monthly term would be a $10
-charge on a plan that renews at $40, so the product pins the plan to
-`pro_yearly` **server-side** on this checkout source and rejects anything else.
-The email copy therefore has to say **"first year"** — a bare "75% off" promises
-a monthly discount that checkout will not honour. That is the template's
-responsibility; the worker only supplies the figure and the link.
+**The two rules are independent.** They share the number 75 today and are still
+two parity rules against two different product surfaces. Do not collapse them
+into one constant, in either repo, or a change to the monthly offer silently
+moves the annual one.
 
-The offer link carries **no lead token**. `/comeback` does not consume one, so
-signing a credential into a URL that cannot use it would be pointless. The
-token-bearing `JOB_URL` / `MATCHES_URL` are still in the payload, so the
+**The 4h link is the only tokenized offer link.** `/your-match` is the same page
+the rest of the sequence's CTAs land on, so the offer click keeps the lead's
+restored survey, resume and match on the screen — a warm click. The app reads
+`offer=monthly75` off the query string to render the monthly offer there.
+Buying binds `surveys.user_id` on the Stripe webhook, which is what drops the
+lead out of every later stage; **clicking without buying binds nothing**, so a
+non-payer stays in the `day1` audience and still gets the free-apply email at
+24h.
+
+**The 72h link carries no token.** `/comeback` does not consume one, so signing
+a credential into a URL that cannot use it would be pointless. The
+token-bearing `JOB_URL` / `MATCHES_URL` are in both payloads, so either
 template can keep a secondary "see your match" CTA.
 
-Two tradeoffs, both accepted by the owner (2026-08-27):
+**Annual only, on the 72h path.** A 75%-off monthly term on the annual plan
+would be a $10 charge on a plan that renews at $40, so the product pins the
+plan to `pro_yearly` **server-side** on that checkout source and rejects
+anything else. The 72h copy therefore has to say **"first year"**. (The 4h
+offer *is* the monthly one, sold on its own checkout path — the two do not
+share a source.)
+
+Two tradeoffs on the 72h path, both accepted by the owner (2026-08-27) and
+unchanged by the 4h offer:
 
 - **`/comeback` is a cold funnel.** Unlike `/your-match`, it does not restore
   the lead's survey and resume — the buyer stays anonymous until `/welcome/:sid`
   after checkout, where the account-claim path binds the subscription. So the
   offer click loses the personalised context the rest of the sequence carries.
   The alternative was building a token-aware variant of a live, converting
-  page; reusing it as-is is what makes this a workers-only change.
+  page; reusing it as-is is what makes this a workers-only change. (The 4h
+  offer does not have this problem — it lands on the warm page.)
 - **Checkout attribution shares the paid-retargeting source.** Both this email
   and the retargeting ads land on the same `retarget_offer` checkout source, so
   Stripe-side they look alike. Email traffic is still separable in analytics by
   `utm_campaign=abandonment_72h`, which no ad uses.
+
+#### UTMs
+
+Every CTA in every email carries `utm_source=brevo&utm_medium=email`, its
+stage's own `utm_campaign`, and `utm_content=<stage id>`. Until 2026-09-09 all
+four stages shared a single `anon_lead` campaign, so the sequence reported as
+one undifferentiated blob and only the 72h `OFFER_URL` was separable; two
+stages now sell different things, which makes per-stage attribution the point.
+
+| Stage | `utm_campaign` | `utm_content` |
+| --- | --- | --- |
+| `first` | `abandonment_4h_offer` | `first` |
+| `day1` | `anon_lead_24h` | `day1` |
+| `day2` | `anon_lead_48h` | `day2` |
+| `day3` | `abandonment_72h` | `day3` |
+
+`abandonment_72h` is deliberately the value it already was, so the separability
+claim above keeps holding. `utm_content` is additive and nothing parses it.
 
 ---
 
@@ -461,9 +569,16 @@ You'll see lines like:
 
 ```
 [DRY RUN] Would send to: jane@example.com — Job: Sales Associate at Instacart (88% match, Posted 2 days ago)
+[DRY RUN] JOB_URL: https://www.usestandout.today/your-match?t=<token>&utm_source=brevo&utm_medium=email&utm_campaign=abandonment_4h_offer&utm_content=first
+[DRY RUN] MATCHES_URL: https://www.usestandout.today/your-match?t=<token>&utm_source=brevo&utm_medium=email&utm_campaign=abandonment_4h_offer&utm_content=first&next=matches
+[DRY RUN] OFFER_URL: https://www.usestandout.today/your-match?t=<token>&offer=monthly75&utm_source=brevo&utm_medium=email&utm_campaign=abandonment_4h_offer&utm_content=first
+[DRY RUN] token payload: {"v":1,"typ":"lead","sv":4242,"jb":99001,"exp":1790169361}
 [DRY RUN] Brevo params: { ... }
 [DRY RUN COMPLETE] Would send 3 of 4 eligible
 ```
+
+The `OFFER_URL` line appears only on the two stages that carry an offer. On the
+4h stage it is the one to read: it must carry both `t=` and `offer=monthly75`.
 
 To send for real locally, set `DRY_RUN=false` in `.env`.
 
@@ -518,7 +633,7 @@ standout-email-workers/
 ├── abandonment-job-email-2/              retired 2026-08-13 — no endpoint, no cron
 ├── abandonment-job-email-resume-trigger/ retired 2026-08-13 — no endpoint, no cron
 ├── api/                                  one thin entrypoint per stage
-│   ├── abandonment-anon-lead-email.js       `first` (1h)
+│   ├── abandonment-anon-lead-email.js       `first` (4h offer)
 │   ├── abandonment-anon-lead-email-24h.js   `day1`  (24h)
 │   ├── abandonment-anon-lead-email-48h.js   `day2`  (48h)
 │   └── abandonment-anon-lead-email-72h.js   `day3`  (72h offer)

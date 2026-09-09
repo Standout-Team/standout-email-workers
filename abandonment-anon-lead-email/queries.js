@@ -20,16 +20,21 @@ const GRANT_IN_CHUNK = 100;
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 
 // --- Window / backfill configuration -------------------------------------
-// Leads get one quiet hour before we mail them; that upper bound never moves,
-// in either mode.
+// The original "leads get one quiet hour before we mail them" settle time.
+// EVERY STAGE NOW SETS ITS OWN delayMs AND spanMs, so neither of the two
+// constants below still describes a live window — `first` moved to 4h/3h on
+// 2026-09-09, and the other three have always set both. They survive as the
+// FALLBACK for a stage that sets no spanMs, and as the shape the derivation
+// below is written against; the upper bound of a real window is always
+// `stage.delayMs`. See computeWindow.
 const SETTLE_MS = ONE_HOUR_MS;
-// Normal mode looks back exactly one hour further, so the hourly cron considers
-// every survey exactly once.
+// One hour further back: the lookback a stage would get if it named neither.
 const NORMAL_LOOKBACK_MS = 2 * ONE_HOUR_MS;
 // The width of one normal-mode cohort for a stage that does not set its own.
-// Derived, not restated, so the launch stage's window stays "the hour that
-// ended delayMs ago" however SETTLE_MS and NORMAL_LOOKBACK_MS move. Stages
-// override it with spanMs — see the retry-budget note in stages.js.
+// Derived, not restated, so a stage without a spanMs keeps a window exactly
+// one hour wide however SETTLE_MS and NORMAL_LOOKBACK_MS move. Every stage in
+// the sequence overrides it with spanMs — see the retry-budget note in
+// stages.js.
 const NORMAL_SPAN_MS = NORMAL_LOOKBACK_MS - SETTLE_MS;
 const spanForStage = (stage) => stage.spanMs || NORMAL_SPAN_MS;
 const MIN_BACKFILL_DAYS = 1;
@@ -282,8 +287,11 @@ function getSupabase() {
  * env, returns bounds plus a `warning` string for the caller to log (never logs
  * itself, so it stays unit-testable and can't double-warn).
  *
- *   normal    [now − 2h, now − 1h]              (BACKFILL_DAYS unset/invalid)
- *   backfill  [now − BACKFILL_DAYS d, now − 1h] (1–30, clamped)
+ *   normal    [now − delay − span, now − delay]        (BACKFILL_DAYS unset/invalid)
+ *   backfill  [now − BACKFILL_DAYS d, now − delay]     (1–30, clamped)
+ *
+ * `delay` and `span` are the stage's own — for `first` that is [now − 7h,
+ * now − 4h], for `day1` [now − 27h, now − 24h], and so on.
  *
  * The backfill window is a strict superset of the normal one — same upper
  * bound — so new abandoners keep being covered while a backfill drains.
@@ -292,9 +300,8 @@ function getSupabase() {
  */
 function computeWindow(nowMs, env = process.env, stageArg = DEFAULT_STAGE) {
   const stage = resolveStage(stageArg);
-  // The upper bound IS the stage delay: the 1h email considers surveys that
-  // settled an hour ago, the 24h email those that settled a day ago. For the
-  // first stage this is SETTLE_MS, so the bounds are unchanged from launch.
+  // The upper bound IS the stage delay: the 4h email considers surveys that
+  // settled four hours ago, the 24h email those that settled a day ago.
   const endMs = nowMs - stage.delayMs;
   const normal = {
     mode: 'normal',
@@ -317,7 +324,7 @@ function computeWindow(nowMs, env = process.env, stageArg = DEFAULT_STAGE) {
   if (!INTEGER_RE.test(text)) {
     return withIso({
       ...normal,
-      warning: `BACKFILL_DAYS="${text}" is not an integer — falling back to the normal 1–2h window.`,
+      warning: `BACKFILL_DAYS="${text}" is not an integer — falling back to the stage's normal window.`,
     });
   }
 
@@ -327,7 +334,7 @@ function computeWindow(nowMs, env = process.env, stageArg = DEFAULT_STAGE) {
       ...normal,
       warning:
         `BACKFILL_DAYS=${requested} is below the minimum of ${MIN_BACKFILL_DAYS} — ` +
-        'falling back to the normal 1–2h window.',
+        "falling back to the stage's normal window.",
     });
   }
 
@@ -858,7 +865,9 @@ function stageExcludesRedeemedGrants(stageArg) {
  * 24h) would land beside it, so the redeemed lead's 24h touch belongs to
  * template 42 and this stage stands down. Nothing else changes:
  *
- *   - `first` (1h) still sends. Moot in practice — redemption comes after it.
+ *   - `first` (4h) still sends. Moot in practice — redemption comes after it,
+ *     and since 2026-09-09 its CTA is the monthly offer rather than the free
+ *     apply, so it is not the email that produces a grant in the first place.
  *   - `day2` (48h, template 44) still sends, so an applier who has not
  *     purchased still gets the 48h tailored nudge.
  *   - A *claimed but unredeemed* grant excludes nothing, anywhere. That is the
@@ -1001,6 +1010,23 @@ async function fetchSurveyRows(win) {
       .from('surveys')
       .select('id, session_id, resume_parsed, created_at, marketing_opt_in_at')
       .eq('marketing_opt_in', true)
+      // `user_id IS NULL` is the anonymity predicate, and it is ALSO the first
+      // exclusion a lead who bought through the 4h offer hits. That offer
+      // link is token-bearing (`/your-match?t=…&offer=monthly75`), so a lead
+      // who converts on it is claimed by the main app's Stripe webhook, which
+      // binds `surveys.user_id` to the new account. Their survey therefore
+      // stops matching here and they are out of every later stage's audience
+      // — the 24h email included, which is the case worth checking because
+      // the 4h and 24h windows are only twenty hours apart. Two further rails
+      // catch the same lead independently if that binding is ever late: the
+      // `profiles` exclusion in findExclusions (they now have an account) and
+      // the paid re-check in isStillUnpaid immediately before dispatch.
+      //
+      // A 4h CLICK that does not convert changes nothing: the offer link
+      // does not claim the survey, so a non-payer keeps `user_id IS NULL` and
+      // stays in the day1 audience. That is deliberate, and the same rule as
+      // the free-apply grant one below — clicking an email must not end the
+      // sequence.
       .is('user_id', null)
       .not('resume_parsed', 'is', null)
       .gte('created_at', win.startIso)
@@ -1027,10 +1053,13 @@ async function fetchSurveyRows(win) {
  * The audience: anonymous, opted-in surveys with a parsed resume that carries a
  * plausible email, in one of two windows (see computeWindow):
  *
- *   normal mode   — created 1–2 hours ago. Hourly cron × 1-hour-wide window =
- *                   every survey is considered exactly once.
+ *   normal mode   — created in the stage's own slice: the `spanMs` window that
+ *                   ended `delayMs` ago (4–7 hours ago for `first`). Hourly
+ *                   cron × a 3-hour-wide window = every survey is considered
+ *                   three times, which is the retry budget stages.js explains;
+ *                   the KV sent-tracker is what keeps that to one email.
  *   backfill mode — BACKFILL_DAYS is set: created between BACKFILL_DAYS ago and
- *                   1 hour ago, i.e. a superset of the normal window, so the
+ *                   `delayMs` ago, i.e. a superset of the normal window, so the
  *                   forward-marching hourly cohort is still covered while the
  *                   backlog drains. Surveys are then reconsidered on every run;
  *                   the persistent sent-tracker (KV) is what makes that

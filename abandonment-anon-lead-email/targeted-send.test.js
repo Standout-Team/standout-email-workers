@@ -220,6 +220,7 @@ const stubs = {
   durable: true,
   sentAlready: new Set(),
   sentTo: [],
+  sentParams: [],
   marked: [],
   targetingSeen: null,
   findAnonLeadsCalls: 0,
@@ -246,6 +247,7 @@ queries.findFeaturedJobs = async (leads) => ({
 });
 brevo.sendJobEmail = async (payload) => {
   stubs.sentTo.push(payload.to[0].email);
+  stubs.sentParams.push(payload.params);
   return 'stub-message-id';
 };
 sentTracker.isDurable = () => stubs.durable;
@@ -304,6 +306,7 @@ function resetStubs(overrides = {}) {
   stubs.durable = true;
   stubs.sentAlready = new Set();
   stubs.sentTo = [];
+  stubs.sentParams = [];
   stubs.marked = [];
   stubs.targetingSeen = null;
   stubs.findAnonLeadsCalls = 0;
@@ -346,6 +349,25 @@ test('run(): a targeted run mails the target and nobody else', async () => {
   assert.equal(summary.sent, 1);
   assert.equal(summary.eligible, 1, 'the cohort is narrowed before the tracker and the cap');
   assert.equal(summary.withheld, 2, 'the two real leads are withheld, not mailed');
+});
+
+test('run(): a targeted send at the default stage carries the 4h offer', async () => {
+  // A targeted send is how the 4h offer email gets rehearsed against a real
+  // QA address, so what actually reaches Brevo on that path is worth pinning:
+  // targeting is a filter, and it must not change the payload at all.
+  resetStubs();
+  await drive({ ...LIVE_ENV, TARGET_EMAILS: 'qa@example.com' }, run);
+
+  assert.equal(stubs.sentParams.length, 1);
+  const params = stubs.sentParams[0];
+  assert.equal(params.OFFER_PERCENT, 75);
+  assert.equal(params.OFFER_FIRST_PRICE, '$10');
+  assert.equal(params.OFFER_RENEWAL_PRICE, '$40/mo');
+  assert.ok(params.OFFER_URL.includes('/your-match?t='), 'the offer link is tokenized');
+  assert.ok(params.OFFER_URL.includes('offer=monthly75'));
+  assert.ok(params.OFFER_URL.includes('utm_campaign=abandonment_4h_offer'));
+  assert.ok(params.OFFER_URL.includes('utm_content=first'));
+  assert.ok(params.JOB_URL.includes('utm_content=first'), 'the match CTA is stamped too');
 });
 
 test('run(): the targeted run logs the unmissable banner', async () => {

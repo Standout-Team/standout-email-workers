@@ -28,10 +28,13 @@ const { fetchTailoredBullets, tailoringConfigured } = require('./tailoring');
 // These people uploaded a resume, opted in, hit the paywall and left — they
 // have no account, so there is nothing to magic-link them into. Instead every
 // CTA carries a signed lead token that /your-match trades for their restored
-// survey + resume and one free apply.
+// survey + resume — and, depending on the stage, one free apply (24h) or the
+// 75%-off-month-one offer (4h). The single exception is day3's OFFER_URL,
+// which points at the cold /comeback page and carries no token.
 //
 // Two modes, both on the same hourly cron and selected purely by env vars:
-// normal (the 1–2h-ago cohort) and backfill (BACKFILL_DAYS, capped by
+// normal (the slice of surveys that settled `stage.delayMs` ago, `stage.spanMs`
+// wide — 4–7h ago for stage `first`) and backfill (BACKFILL_DAYS, capped by
 // SEND_CAP, newest-first, drained cap-per-hour). See computeWindow in
 // queries.js and the "Backfill procedure" section of the repo README.
 //
@@ -42,11 +45,43 @@ const { fetchTailoredBullets, tailoringConfigured } = require('./tailoring');
 // the README.
 // ---------------------------------------------------------------------------
 
-const UTM = {
-  utm_source: 'brevo',
-  utm_medium: 'email',
-  utm_campaign: 'anon_lead',
-};
+// Every CTA in every email carries the same source/medium; the campaign and
+// the content are per stage.
+const UTM_BASE = Object.freeze({ utm_source: 'brevo', utm_medium: 'email' });
+
+// One campaign per stage. Until 2026-09-09 all four shared a single
+// `anon_lead` campaign, so the sequence reported as one undifferentiated blob
+// and the only separable traffic was the 72h offer's own OFFER_URL. Two of the
+// four now sell different things, which makes per-stage attribution the point
+// rather than a nicety.
+//
+// `abandonment_72h` is deliberately the value it already was — the README's
+// claim that email traffic is separable from the retargeting ads by
+// `utm_campaign=abandonment_72h` has to keep holding.
+const UTM_CAMPAIGN_BY_STAGE = Object.freeze({
+  first: 'abandonment_4h_offer',
+  day1: 'anon_lead_24h',
+  day2: 'anon_lead_48h',
+  day3: 'abandonment_72h',
+});
+
+/**
+ * The UTM parameters for one stage's links, in the order they appear in a URL.
+ * `utm_content` is the stage id on every CTA, so a click can be attributed to
+ * the email that produced it even where two stages share a campaign name.
+ *
+ * A stage with no campaign entry falls back to the pre-2026-09-09 `anon_lead`
+ * rather than emitting a link with no campaign at all: a new stage should show
+ * up as unattributed-but-present in analytics, not vanish from it.
+ */
+function utmFor(stageArg) {
+  const stage = resolveStage(stageArg);
+  return {
+    ...UTM_BASE,
+    utm_campaign: UTM_CAMPAIGN_BY_STAGE[stage.id] || 'anon_lead',
+    utm_content: stage.id,
+  };
+}
 
 // Sent-tracker lookups are one KV round-trip each; a backfill cohort is big
 // enough that doing them serially would eat the invocation.
@@ -102,17 +137,18 @@ function appBaseUrl(env = process.env) {
  * Returns null when EMAIL_LINK_SECRET is missing: there is no useful fallback
  * URL, the landing page cannot resolve the lead without a token.
  */
-function buildLinks(lead, job) {
+function buildLinks(lead, job, stage) {
   const secret = process.env.EMAIL_LINK_SECRET;
   if (!secret) return null;
 
   const appUrl = appBaseUrl();
   const token = signLeadToken({ sv: lead.survey_id, jb: job.id }, secret);
+  const utm = utmFor(stage);
 
-  const jobUrl = `${appUrl}/your-match?${new URLSearchParams({ t: token, ...UTM }).toString()}`;
+  const jobUrl = `${appUrl}/your-match?${new URLSearchParams({ t: token, ...utm }).toString()}`;
   const matchesUrl = `${appUrl}/your-match?${new URLSearchParams({
     t: token,
-    ...UTM,
+    ...utm,
     next: 'matches',
   }).toString()}`;
 
@@ -149,27 +185,47 @@ function buildPayload(lead, job, pct, reasons, links, stage, bullets) {
     params.BULLET_COUNT = bullets.length;
   }
 
-  // The discount, for the stage that carries one — conditional exactly like the
-  // bullets above, so a stage without an offer sends neither param and its
-  // template can never reference a figure the worker did not supply.
+  // The discount, for the stages that carry one — conditional exactly like the
+  // bullets above, so a stage without an offer sends none of these params and
+  // its template can never reference a figure the worker did not supply. That
+  // rule is per param, not per block: day3 states no prices, so it sends no
+  // OFFER_FIRST_PRICE / OFFER_RENEWAL_PRICE rather than sending them empty.
   //
-  // OFFER_URL is a PLAIN link: /comeback does not consume a lead token (it is a
-  // cold page — the lead's restored survey comes from the account-claim path
-  // after checkout, not from us), so there is nothing to sign into it. The
-  // token-bearing JOB_URL / MATCHES_URL stay in the payload above, which is
-  // what lets the template keep a secondary "see your match" link.
+  // EVERY FIGURE HERE COMES OFF THE STAGE. There is no percent and no price
+  // literal in this file — see the parity rules in stages.js, which are what
+  // keep each number equal to the one the landing page renders and Stripe
+  // charges.
   //
-  // The offer is ANNUAL-ONLY — the product pins the plan to pro_yearly
-  // server-side on this checkout source — so the template's copy has to say
-  // "first year". A bare "75% off" would promise a monthly discount that
-  // checkout will not honour.
+  // Two shapes of offer link, chosen by `offer.tokenized`:
+  //
+  //   tokenized (first / 4h)  /your-match is the same token-bearing landing
+  //       page the rest of the sequence uses, so the offer link carries the
+  //       lead token and `offer=<param>`. The app trades the token for the
+  //       lead's restored survey + resume and reads the flag to show the
+  //       monthly offer — a warm click, with their match still on the page.
+  //
+  //   plain (day3 / 72h)  /comeback does not consume a lead token (it is a
+  //       cold page — the lead's restored survey comes from the account-claim
+  //       path after checkout, not from us), so there is nothing to sign into
+  //       it and signing one anyway would leak a credential into a URL that
+  //       cannot use it. Its offer is ANNUAL-ONLY — the product pins the plan
+  //       to pro_yearly server-side on that checkout source — so its copy has
+  //       to say "first year"; a bare "75% off" would promise a monthly
+  //       discount that checkout will not honour.
+  //
+  // Either way the token-bearing JOB_URL / MATCHES_URL stay in the payload
+  // above, which is what lets every template keep a secondary "see your match"
+  // link beside the offer.
   const { offer } = resolveStage(stage);
   if (offer) {
+    const query = offer.tokenized
+      ? { t: links.token, offer: offer.param, ...utmFor(stage) }
+      : { ...utmFor(stage) };
+
     params.OFFER_PERCENT = offer.percent;
-    params.OFFER_URL = `${appBaseUrl()}${offer.path}?${new URLSearchParams({
-      ...UTM,
-      utm_campaign: 'abandonment_72h',
-    }).toString()}`;
+    params.OFFER_URL = `${appBaseUrl()}${offer.path}?${new URLSearchParams(query).toString()}`;
+    if (offer.firstTermPrice) params.OFFER_FIRST_PRICE = offer.firstTermPrice;
+    if (offer.renewalPrice) params.OFFER_RENEWAL_PRICE = offer.renewalPrice;
   }
 
   return {
@@ -239,8 +295,9 @@ async function run(options = {}) {
   const dryRun = isDryRun();
 
   // Which email in the sequence this invocation is sending. One cron entry per
-  // stage, each pinning EMAIL_STAGE; an unset value is the 1h email, so the
-  // existing cron keeps behaving exactly as it did before the sequence existed.
+  // stage, each pinning EMAIL_STAGE; an unset value is stage `first`, so the
+  // existing cron keeps resolving to the same stage it did before the sequence
+  // existed (that stage's email became the 4h offer on 2026-09-09).
   // Explicit argument first, EMAIL_STAGE second. The argument is what makes
   // three hourly crons possible: Vercel cron entries carry only a path and a
   // schedule — there are NO per-cron environment variables — so three crons
@@ -521,7 +578,7 @@ async function run(options = {}) {
 
   for (const { lead, job, pct } of sendable) {
     try {
-      const links = buildLinks(lead, job);
+      const links = buildLinks(lead, job, stage);
       if (!links) {
         console.warn(
           `[abandonment-anon-lead-email] EMAIL_LINK_SECRET is not set — skipping ${lead.email_lc}; ` +
@@ -552,7 +609,17 @@ async function run(options = {}) {
           `[DRY RUN] Would send to: ${lead.email} — Job: ${job.title} at ${job.company} ` +
             `(${pct}% match, ${formatJobAge(job.first_seen_at) || 'no age badge'})`
         );
+        // The URL self-check. Print every CTA the template will render, not
+        // just the first one: two stages now carry an offer, and the offer is
+        // the CTA an operator most needs to eyeball before a real send — the
+        // 4h one is the only link in the sequence that carries BOTH a lead
+        // token and an offer flag, so a rehearsal is where a missing `t=` or a
+        // wrong `offer=` gets caught.
         console.log(`[DRY RUN] JOB_URL: ${links.jobUrl}`);
+        console.log(`[DRY RUN] MATCHES_URL: ${links.matchesUrl}`);
+        if (payload.params.OFFER_URL) {
+          console.log(`[DRY RUN] OFFER_URL: ${payload.params.OFFER_URL}`);
+        }
         console.log('[DRY RUN] token payload:', JSON.stringify(decodeLeadToken(links.token)));
         console.log('[DRY RUN] Brevo params:', JSON.stringify(payload.params, null, 2));
         sentCount++;
@@ -646,7 +713,7 @@ async function run(options = {}) {
  * invocation — Vercel only fires crons on production deployments, so a staging
  * run is someone POSTing this endpoint by hand and it needs to be able to pick
  * a stage without a redeploy. An unknown value throws rather than falling back
- * to the 1h email, which would mail the wrong copy on the wrong schedule.
+ * to stage `first`, which would mail the wrong copy on the wrong schedule.
  */
 function createHandler(stageId) {
   return async function handler(req, res) {
@@ -663,7 +730,7 @@ function createHandler(stageId) {
   };
 }
 
-// Default export stays the 1h email so the existing cron path is unchanged.
+// Default export stays stage `first` so the existing cron path is unchanged.
 const handler = createHandler(null);
 
 module.exports = handler;
@@ -677,6 +744,7 @@ module.exports._internals = {
   appBaseUrl,
   buildLinks,
   buildPayload,
+  utmFor,
 };
 
 // Run directly via `node index.js`

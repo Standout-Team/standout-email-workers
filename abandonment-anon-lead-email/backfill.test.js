@@ -10,11 +10,22 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 
 const { computeWindow, resolveSendCap, selectForSend, _internals } = require('./queries');
+const { EMAIL_STAGES } = require('./stages');
 
-const { MAX_BACKFILL_DAYS, DEFAULT_BACKFILL_SEND_CAP, NORMAL_LOOKBACK_MS, SETTLE_MS, ONE_DAY_MS } = _internals;
+const { MAX_BACKFILL_DAYS, DEFAULT_BACKFILL_SEND_CAP, ONE_DAY_MS } = _internals;
 
 // Fixed clock so the assertions are exact: 2026-08-12T12:00:00.000Z.
 const NOW = Date.parse('2026-08-12T12:00:00.000Z');
+
+// These call computeWindow without a stage, so they exercise the default —
+// stage `first`. Its bounds are derived from the stage rather than restated,
+// because the numbers moved once already (1h/1h → 4h/3h on 2026-09-09) and the
+// backfill knobs under test here are the part that did NOT change: the upper
+// bound is whatever the stage's delay is, and BACKFILL_DAYS only ever moves the
+// lower one.
+const FIRST = EMAIL_STAGES.first;
+const NORMAL_END_MS = NOW - FIRST.delayMs;                 // 2026-08-12T08:00:00.000Z
+const NORMAL_START_MS = NORMAL_END_MS - FIRST.spanMs;      // 2026-08-12T05:00:00.000Z
 
 test('computeWindow: normal mode when BACKFILL_DAYS is unset', () => {
   const win = computeWindow(NOW, {});
@@ -22,10 +33,10 @@ test('computeWindow: normal mode when BACKFILL_DAYS is unset', () => {
   assert.equal(win.mode, 'normal');
   assert.equal(win.backfillDays, null);
   assert.equal(win.warning, null);
-  assert.equal(win.startMs, NOW - NORMAL_LOOKBACK_MS);
-  assert.equal(win.endMs, NOW - SETTLE_MS);
-  assert.equal(win.startIso, '2026-08-12T10:00:00.000Z');
-  assert.equal(win.endIso, '2026-08-12T11:00:00.000Z');
+  assert.equal(win.startMs, NORMAL_START_MS);
+  assert.equal(win.endMs, NORMAL_END_MS);
+  assert.equal(win.startIso, '2026-08-12T05:00:00.000Z');
+  assert.equal(win.endIso, '2026-08-12T08:00:00.000Z');
 });
 
 test('computeWindow: an empty or whitespace BACKFILL_DAYS is "unset", not invalid', () => {
@@ -36,16 +47,16 @@ test('computeWindow: an empty or whitespace BACKFILL_DAYS is "unset", not invali
   }
 });
 
-test('computeWindow: BACKFILL_DAYS=14 looks back 14 days and keeps the 1h upper bound', () => {
+test("computeWindow: BACKFILL_DAYS=14 looks back 14 days and keeps the stage's upper bound", () => {
   const win = computeWindow(NOW, { BACKFILL_DAYS: '14' });
 
   assert.equal(win.mode, 'backfill');
   assert.equal(win.backfillDays, 14);
   assert.equal(win.warning, null);
   assert.equal(win.startMs, NOW - 14 * ONE_DAY_MS);
-  assert.equal(win.endMs, NOW - SETTLE_MS);
+  assert.equal(win.endMs, NORMAL_END_MS);
   assert.equal(win.startIso, '2026-07-29T12:00:00.000Z');
-  assert.equal(win.endIso, '2026-08-12T11:00:00.000Z');
+  assert.equal(win.endIso, '2026-08-12T08:00:00.000Z');
 });
 
 test('computeWindow: the backfill window is a superset of the normal one', () => {
@@ -78,7 +89,7 @@ test('computeWindow: BACKFILL_DAYS=0 warns and falls back to normal', () => {
 
   assert.equal(win.mode, 'normal');
   assert.equal(win.backfillDays, null);
-  assert.equal(win.startMs, NOW - NORMAL_LOOKBACK_MS);
+  assert.equal(win.startMs, NORMAL_START_MS);
   assert.match(win.warning, /BACKFILL_DAYS=0/);
   assert.match(win.warning, /normal/);
 });
@@ -87,7 +98,7 @@ test('computeWindow: a negative BACKFILL_DAYS warns and falls back to normal', (
   const win = computeWindow(NOW, { BACKFILL_DAYS: '-3' });
 
   assert.equal(win.mode, 'normal');
-  assert.equal(win.startMs, NOW - NORMAL_LOOKBACK_MS);
+  assert.equal(win.startMs, NORMAL_START_MS);
   assert.match(win.warning, /below the minimum/);
 });
 
@@ -104,7 +115,7 @@ test('computeWindow: non-integer BACKFILL_DAYS warns and falls back to normal', 
   for (const raw of ['fourteen', '14.5', '14d', '2 weeks', 'true', '1e3']) {
     const win = computeWindow(NOW, { BACKFILL_DAYS: raw });
     assert.equal(win.mode, 'normal', `BACKFILL_DAYS=${JSON.stringify(raw)} should not backfill`);
-    assert.equal(win.startMs, NOW - NORMAL_LOOKBACK_MS);
+    assert.equal(win.startMs, NORMAL_START_MS);
     assert.match(win.warning, /is not an integer/);
   }
 });
