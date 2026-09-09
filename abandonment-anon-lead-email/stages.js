@@ -96,15 +96,21 @@
  *   `first.offer`  percent / firstTermPrice / renewalPrice MUST stay equal to
  *                  the LEAD-OFFER constants in Standout-pro's
  *                  `shared/retarget-offer.ts` (LEAD_OFFER_DISCOUNT_PERCENT = 75)
- *                  and to the pro_monthly Group A sticker ($40/mo → $10 for
- *                  month one). `/your-match?offer=monthly75` renders from them.
+ *                  and to the percent_off on THIS OFFER'S OWN Stripe coupon,
+ *                  "Brevo_Anon_Lead_75% off" (id b0XANPC4, overridable via
+ *                  STRIPE_COUPON_LEAD_OFFER_75) — not the annual coupon below.
+ *                  Prices must match the pro_monthly Group A sticker ($40/mo →
+ *                  $10 for month one). `/your-match?offer=monthly75` renders
+ *                  from them.
  *   `day3.offer`   percent MUST stay equal to RETARGET_DISCOUNT_PERCENT in the
  *                  same file (= 75) and to STRIPE_COUPON_RETARGET_75's own
  *                  percent_off. `/comeback` renders its prices from it.
  *
  * The two happen to share the number 75 today. They are still two independent
- * parity rules against two different product surfaces — do not collapse them
- * into one constant here, or a change to one offer silently moves the other.
+ * parity rules against two different product surfaces — a Stripe coupon each,
+ * so ending one campaign leaves the other alone. Do not collapse them into one
+ * constant here, or one coupon in Stripe, or a change to one offer silently
+ * moves the other.
  */
 
 const ONE_HOUR_MS = 60 * 60 * 1000;
@@ -145,7 +151,11 @@ const EMAIL_STAGES = Object.freeze({
     // prices are stated here and nowhere else in this repo, and `tokenized`
     // is what tells buildPayload to sign the lead token into the link — unlike
     // day3's cold /comeback URL. `param` is the flag the main app reads
-    // (`/your-match?offer=monthly75`). See the parity rules at the top.
+    // (`/your-match?offer=monthly75`). The percent must equal
+    // LEAD_OFFER_DISCOUNT_PERCENT in Standout-pro's shared/retarget-offer.ts
+    // and the percent_off on this offer's own Stripe coupon,
+    // "Brevo_Anon_Lead_75% off" (id b0XANPC4) — NOT the annual
+    // STRIPE_COUPON_RETARGET_75 day3 charges. See the parity rules at the top.
     offer: Object.freeze({
       percent: 75,
       path: '/your-match',

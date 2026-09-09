@@ -484,20 +484,25 @@ Full 4h offer URL:
 | `OFFER_PERCENT` / `OFFER_URL` / `OFFER_FIRST_PRICE` / `OFFER_RENEWAL_PRICE` | `buildPayload` in `index.js` | sent **only** for a stage carrying an `offer`, and only the params that stage actually states. `index.js` contains no percent and no price of its own |
 | `LEAD_OFFER_DISCOUNT_PERCENT` | Standout-pro `shared/retarget-offer.ts` | `= 75`; `/your-match?offer=monthly75` renders the monthly offer from it, against the pro_monthly **Group A** sticker ($40/mo → $10 month one) |
 | `RETARGET_DISCOUNT_PERCENT` | same file | `= 75`; `/comeback` renders its annual prices from it |
-| `STRIPE_COUPON_RETARGET_75` | Standout-pro Vercel env | the Stripe coupon actually charged on the annual path. Both checkout routes **hard-fail (503)** when it is unset rather than quietly charging full price |
+| `STRIPE_COUPON_LEAD_OFFER_75` | Standout-pro Vercel env (optional) | the Stripe coupon actually charged on the **monthly** path — "Brevo_Anon_Lead_75% off", id `b0XANPC4`, 75% off / `duration=once`. The env var only overrides it; unset, the checkout route uses that id. It **hard-fails (503)** rather than quietly charging full price if the var is set to an empty value |
+| `STRIPE_COUPON_RETARGET_75` | Standout-pro Vercel env | the Stripe coupon actually charged on the **annual** path — a *different* coupon, so ending either campaign leaves the other alone. Both `/comeback` checkout routes **hard-fail (503)** when it is unset rather than quietly charging full price |
 
 **Each percent is one number in three places, and they must not drift.** The
 email advertises it, the landing page renders prices from it, Stripe charges
 it. If `stages.first.offer.percent` diverges from `LEAD_OFFER_DISCOUNT_PERCENT`
-(or its prices from the pro_monthly Group A sticker), or `stages.day3.offer.percent`
-from `RETARGET_DISCOUNT_PERCENT` or the coupon's `percent_off`, the lead is
-shown one number and billed another — the failure mode both codebases treat as
-unacceptable. Change all three in the same sitting or none of them.
+or from the "Brevo_Anon_Lead_75% off" coupon's `percent_off` (or its prices
+from the pro_monthly Group A sticker), or `stages.day3.offer.percent`
+from `RETARGET_DISCOUNT_PERCENT` or `STRIPE_COUPON_RETARGET_75`'s
+`percent_off`, the lead is shown one number and billed another — the failure
+mode both codebases treat as unacceptable. Change all three in the same sitting
+or none of them.
 
 **The two rules are independent.** They share the number 75 today and are still
-two parity rules against two different product surfaces. Do not collapse them
-into one constant, in either repo, or a change to the monthly offer silently
-moves the annual one.
+two parity rules against two different product surfaces — down to a Stripe
+coupon each ("Brevo_Anon_Lead_75% off" for the 4h monthly offer,
+`STRIPE_COUPON_RETARGET_75` for the 72h annual one). Do not collapse them
+into one constant, in either repo, or one coupon in Stripe, or a change to the
+monthly offer silently moves the annual one.
 
 **The 4h link is the only tokenized offer link.** `/your-match` is the same page
 the rest of the sequence's CTAs land on, so the offer click keeps the lead's
