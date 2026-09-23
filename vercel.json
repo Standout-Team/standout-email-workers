@@ -1,41 +1,13 @@
 {
   "functions": {
-    "api/abandonment-anon-lead-email.js": {
-      "maxDuration": 300
-    },
-    "api/abandonment-anon-lead-email-24h.js": {
-      "maxDuration": 300
-    },
-    "api/abandonment-anon-lead-email-48h.js": {
-      "maxDuration": 300
-    },
-    "api/abandonment-anon-lead-email-72h.js": {
-      "maxDuration": 300
-    },
-    "api/post-apply-followup-email.js": {
+    "api/cart-recovery.js": {
       "maxDuration": 300
     }
   },
   "crons": [
     {
-      "path": "/api/abandonment-anon-lead-email",
-      "schedule": "0 * * * *"
-    },
-    {
-      "path": "/api/abandonment-anon-lead-email-24h",
-      "schedule": "20 * * * *"
-    },
-    {
-      "path": "/api/abandonment-anon-lead-email-48h",
-      "schedule": "40 * * * *"
-    },
-    {
-      "path": "/api/post-apply-followup-email",
-      "schedule": "50 * * * *"
-    },
-    {
-      "path": "/api/abandonment-anon-lead-email-72h",
-      "schedule": "10 * * * *"
+      "path": "/api/cart-recovery",
+      "schedule": "5 * * * *"
     }
   ]
 }
