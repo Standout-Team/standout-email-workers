@@ -139,6 +139,7 @@ test('buildParams: link carries a verifiable token that expires at the offer dea
   assert.deepEqual(payload, { v: 1, typ: 'recovery', sv: 9, off: 'm75', st: 5, exp: Math.floor(s.deadlines.deadline1 / 1000) });
   assert.equal(p5.DEADLINE, 'Friday, Sep 25 at 11:59 PM EDT');
   assert.equal(p5.FREE_APPLY_UNUSED, true);
+  assert.equal(p5.TZ, 'EDT');
   const payload6 = JSON.parse(Buffer.from(new URL(p6.OFFER_URL).searchParams.get('t').split('.')[0], 'base64url').toString());
   assert.equal(payload6.off, 'a75');
   assert.equal(payload6.exp, Math.floor(s.deadlines.deadline2 / 1000));
@@ -208,4 +209,17 @@ test('run: live mode sends once per stage, honors exclusions and spacing', async
     store.isDurable = origDurable;
     if (prevUrl === undefined) delete process.env.KV_REST_API_URL;
   }
+});
+
+test('templates: six, approved CTAs, no em dashes, unsubscribe link, only known params', () => {
+  const { TEMPLATES } = require('./templates');
+  assert.equal(TEMPLATES.length, 6);
+  const ctas = ['Get my first month for $10', 'Start for $10', 'Get my first month for $10', 'Start for $10', 'Get my first month for $10', 'Get 9 months free'];
+  const known = new Set(['FIRSTNAME', 'OFFER_URL', 'DEADLINE', 'TZ', 'FREE_APPLY_UNUSED', 'OFFER_FIRST_PRICE', 'OFFER_RENEWAL_PRICE']);
+  TEMPLATES.forEach((t, i) => {
+    assert.ok(t.html.includes(ctas[i]), `E${t.n} CTA`);
+    assert.ok(t.html.includes('{{ unsubscribe }}'), `E${t.n} unsubscribe`);
+    assert.ok(!/\u2014/.test(t.html + t.subject + t.preview), `E${t.n} em dash`);
+    for (const m of t.html.matchAll(/params\.([A-Z_0-9]+)/g)) assert.ok(known.has(m[1]), `E${t.n} unknown param ${m[1]}`);
+  });
 });
