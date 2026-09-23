@@ -89,6 +89,13 @@ function offerUrl({ env, token, stage }) {
   return `${appBaseUrl(env)}/special-offer?${q.toString()}`;
 }
 
+function tzAbbrev(ms, tz) {
+  const part = new Intl.DateTimeFormat('en-US', { timeZone: tz, timeZoneName: 'short' })
+    .formatToParts(new Date(ms))
+    .find((x) => x.type === 'timeZoneName');
+  return part ? part.value : '';
+}
+
 function buildParams({ lead, stage, slot, tz, env, freeApplyUnused }) {
   const offer = OFFERS[stage.offer];
   const token = signRecoveryToken(
@@ -99,6 +106,7 @@ function buildParams({ lead, stage, slot, tz, env, freeApplyUnused }) {
     FIRSTNAME: lead.first_name || '',
     OFFER_URL: offerUrl({ env, token, stage }),
     DEADLINE: formatDeadline(slot.expMs, tz),
+    TZ: tzAbbrev(slot.expMs, tz),
     OFFER_FIRST_PRICE: offer.firstPrice,
     OFFER_RENEWAL_PRICE: offer.renewalPrice,
     FREE_APPLY_UNUSED: freeApplyUnused ? true : '',
