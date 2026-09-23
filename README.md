@@ -6,9 +6,42 @@ never touches the main Standout app codebase.
 
 ## Workers
 
-`abandonment-anon-lead-email/` is the only worker with a live endpoint and cron. Three
-older workers were retired on 2026-08-13 — their code is still in-tree but they no longer
-run; see [Retired workers](#retired-workers).
+`cart-recovery/` is the only worker with a live endpoint and cron (since 2026-09-23). Every
+earlier flow, including `abandonment-anon-lead-email/` (4h/24h/48h/72h) and
+`post-apply-followup-email/`, is switched off: their `api/` entry points and crons were
+removed. Their code is still in-tree for reference; `cart-recovery/` reuses a few pure
+helpers from `abandonment-anon-lead-email/queries.js`.
+
+### `cart-recovery/`
+
+One hourly cron (`/api/cart-recovery`, minute 5) runs a six-email discount sequence for
+everyone who uploaded a resume and opted in to marketing but has not paid, whether or not
+they reached checkout. Anonymous leads are mailed at their resume email; registered
+(non-anonymous) accounts at their account email.
+
+| Email | When (recipient local time) | Offer | Link expires |
+| --- | --- | --- | --- |
+| e1 | T = upload + 1h | $10 first month, then $40/mo | deadline1 |
+| e2 | T + 5h | same | deadline1 |
+| e3 | day 1, 10:00 | same | deadline1 |
+| e4 | day 1, 17:00 | same | deadline1 |
+| e5 | day 2, 17:00 ("ends tonight") | same | deadline1 = day 2, 23:59 |
+| e6 | day 5, 16:00 | "9 months free": $40 first year, then $160/yr | deadline2 = e6 + 48h |
+
+Every send is pushed out of 21:00–08:00, spaced at least 4h apart, retried for 3h, and
+skipped if it can no longer go out before its deadline. Links go to
+`/special-offer?t=<signed recovery token>` on the app, which prices from the token and
+refuses expired links at checkout. Deterministic 15% holdout by email hash. One enrollment
+per address per 60 days (KV namespace `cr1:`).
+
+Env: `CART_RECOVERY_ENABLED` (must be `true`), `DRY_RUN` (anything but `false` counts
+only), `CART_RECOVERY_CUTOVER` (ISO time; nothing created before it is eligible),
+`EMAIL_LINK_SECRET` (same as the app), `BREVO_API_KEY`, `BREVO_TEMPLATE_ID_CR_E1..E6`,
+`CRON_SECRET` (without it the endpoint only dry-runs), optional `CART_RECOVERY_TZ`
+(default America/New_York), `CART_RECOVERY_HOLDOUT_PCT` (default 15),
+`CART_RECOVERY_US_ONLY` (default off), `SEND_CAP` (default 500), `STANDOUT_APP_URL`.
+Brevo params: `FIRSTNAME`, `OFFER_URL`, `DEADLINE`, `OFFER_FIRST_PRICE`,
+`OFFER_RENEWAL_PRICE`, `FREE_APPLY_UNUSED`.
 
 ### `abandonment-anon-lead-email/`
 
