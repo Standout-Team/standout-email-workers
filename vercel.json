@@ -1,13 +1,3 @@
 {
-  "functions": {
-    "api/cart-recovery.js": {
-      "maxDuration": 300
-    }
-  },
-  "crons": [
-    {
-      "path": "/api/cart-recovery",
-      "schedule": "5 * * * *"
-    }
-  ]
+  "crons": []
 }

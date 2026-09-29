@@ -1,7 +1,7 @@
 {
   "name": "standout-email-workers",
   "version": "1.0.0",
-  "description": "Hourly abandoned-user job recommendation worker for Standout",
+  "description": "Retired email workers for Standout (historical record; nothing deploys from here)",
   "type": "commonjs",
   "scripts": {
     "test": "node --test"
