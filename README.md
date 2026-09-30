@@ -4,15 +4,60 @@ Standalone email automation workers for [Standout](https://standout.jobs). Each 
 lives in its own directory, reads from the production Supabase database (read-only), and
 never touches the main Standout app codebase.
 
+## Retired 2026-09-29
+
+**No worker runs from this repository any more.** There is no `api/` entry point and the
+`crons` array in [`vercel.json`](./vercel.json) is empty, so a deploy of this repo serves
+nothing and schedules nothing.
+
+`cart-recovery/`, the last live worker, was ported into the main `Standout-pro` app on
+**2026-09-29**: the sequence now lives in `server/marketing/cart-recovery/*`, runs as the
+Inngest function `server/inngest/functions/cart-recovery.ts`, and keeps its enrollment
+state in the Postgres table `cart_recovery_enrollments` instead of Vercel KV. Its cron and
+its entry point (`api/cart-recovery.js`) were removed here in the same commit — the entry
+point, not just the cron, for the reason in
+[What was deleted, and why the entry point and not just the cron](#what-was-deleted-and-why-the-entry-point-and-not-just-the-cron).
+
+The worker directories stay in-tree as the **historical record only**. Nothing below
+describes something that runs; read it as documentation of what did. Changes to the
+cart-recovery sequence belong in `Standout-pro`, not here.
+
+What is left is for the owner, outside the repo:
+
+- [ ] **Delete this repo's Vercel project.** With no entry point it serves nothing, but it
+      still holds the credentials below.
+- [ ] **Rotate or delete the Supabase service-role key** (`SUPABASE_SERVICE_KEY`) this
+      project held. The workers only read with it, but the key itself bypasses RLS on
+      production, so a stale copy is a full-database credential.
+- [ ] **Rotate or delete the Brevo API key** (`BREVO_API_KEY`) this project held.
+- [ ] **Delete the Vercel KV / Upstash store** (`KV_REST_API_URL` / `KV_REST_API_TOKEN`) —
+      the `cr1:` enrollments and the retired workers' send receipts. Nothing reads it now:
+      the port keeps its state in Postgres.
+- [ ] **Delete `CRON_SECRET`.** It guarded the one endpoint that no longer exists.
+- [ ] **Archive the repository on GitHub** (Settings → Archive this repository), so it
+      reads as read-only history and nobody re-deploys it by mistake.
+
+`EMAIL_LINK_SECRET` on this project is a **copy of the main app's** secret: delete the copy
+with the project, but do not rotate it from here — rotating it is an app change, and it
+would invalidate every live link the app has signed.
+
+---
+
 ## Workers
 
-`cart-recovery/` is the only worker with a live endpoint and cron (since 2026-09-23). Every
+`cart-recovery/` was the last worker with a live endpoint and cron (2026-09-23 to
+2026-09-29), and it is now retired too — see [Retired 2026-09-29](#retired-2026-09-29). Every
 earlier flow, including `abandonment-anon-lead-email/` (4h/24h/48h/72h) and
 `post-apply-followup-email/`, is switched off: their `api/` entry points and crons were
 removed. Their code is still in-tree for reference; `cart-recovery/` reuses a few pure
 helpers from `abandonment-anon-lead-email/queries.js`.
 
 ### `cart-recovery/`
+
+> **Historical.** Retired 2026-09-29 — ported to `Standout-pro`
+> (`server/marketing/cart-recovery/*`, Inngest function
+> `server/inngest/functions/cart-recovery.ts`, state in `cart_recovery_enrollments`). Its
+> entry point and cron are gone; the description below is of how it ran here.
 
 One hourly cron (`/api/cart-recovery`, minute 5) runs a six-email discount sequence for
 everyone who uploaded a resume and opted in to marketing but has not paid, whether or not
